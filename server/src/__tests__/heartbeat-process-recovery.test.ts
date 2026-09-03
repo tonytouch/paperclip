@@ -649,6 +649,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(settledRun?.status).toBe("succeeded");
   });
 
+  it("reaps a local-child run still tracked in-memory after its OS process died", async () => {
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      agentStatus: "running",
+      runStatus: "running",
+      processPid: 999_999_999,
+      processGroupId: null,
+      includeIssue: true,
+    });
+
+    // Simulate a stale in-memory handle: the supervisor still believes the run is live
+    // even though the OS process is gone. Before the liveness re-validation this run was
+    // skipped forever and stuck in "running".
+    runningProcesses.set(runId, { pid: 999_999_999 });
+
+    const reaperHeartbeat = heartbeatService(db);
+    const result = await reaperHeartbeat.reapOrphanedRuns({ staleThresholdMs: 0 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toContain(runId);
+
+    const reaped = await reaperHeartbeat.getRun(runId);
+    expect(reaped?.status).toBe("failed");
+    expect(reaped?.errorCode).toBe("process_lost");
+    expect(runningProcesses.has(runId)).toBe(false);
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("failed");
+  });
+
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";

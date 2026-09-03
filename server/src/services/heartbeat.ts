@@ -10608,7 +10608,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
+      const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
+
+      // Runs tracked in-memory are normally still executing. An in-memory handle can go
+      // stale when the OS process dies without delivering an exit event (e.g. an external
+      // SIGKILL, an OOM kill, or a crash the supervisor missed), leaving the run stuck in
+      // "running" forever. For local-child adapters we re-validate OS liveness; a dead
+      // process means the run is orphaned and must be reaped. Remote/cloud adapters expose
+      // no local pid to verify, so we trust in-memory tracking for them.
+      const trackedInMemory = runningProcesses.has(run.id) || activeRunExecutions.has(run.id);
+      if (trackedInMemory && !tracksLocalChild) continue;
+      if (trackedInMemory && (processPidAlive || processGroupAlive)) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -10616,9 +10628,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
-      const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
