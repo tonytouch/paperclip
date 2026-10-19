@@ -29,6 +29,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -263,6 +264,264 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  async function seedQuotaBackoffFixture(input: {
+    companyId: string;
+    agentId: string;
+    now: Date;
+    failureCount?: number;
+  }) {
+    const issuePrefix = `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: input.companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: input.agentId,
+      companyId: input.companyId,
+      name: "Quota Backoff",
+      role: "engineer",
+      status: "idle",
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          intervalSec: 3600,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+      // Old enough that the interval timer considers this agent due.
+      lastHeartbeatAt: new Date(input.now.getTime() - 2 * 60 * 60 * 1000),
+    });
+
+    const failureCount = input.failureCount ?? 1;
+    for (let index = 0; index < failureCount; index += 1) {
+      const createdAt = new Date(input.now.getTime() - (failureCount - index) * 5 * 60 * 1000);
+      await db.insert(heartbeatRuns).values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "timer",
+        status: "failed",
+        error: "Rate limit exceeded. Please try again later.",
+        errorCode: "provider_quota",
+        finishedAt: new Date(createdAt.getTime() + 1_000),
+        resultJson: { errorFamily: "provider_quota" },
+        contextSnapshot: { source: "scheduler", reason: "interval_elapsed" },
+        updatedAt: createdAt,
+        createdAt,
+      });
+    }
+  }
+
+  it("defers timer wakes while the provider-quota enqueue backoff is active", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedQuotaBackoffFixture({ companyId, agentId, now, failureCount: 1 });
+
+    const tick = await heartbeat.tickTimers(now);
+
+    expect(tick.enqueued).toBe(0);
+    const skipRows = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        status: agentWakeupRequests.status,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "heartbeat.provider_quota_backoff"));
+    expect(skipRows).toHaveLength(1);
+    expect(skipRows[0]?.status).toBe("skipped");
+    const details = (skipRows[0]?.payload as Record<string, unknown> | null)?.heartbeatSkip as
+      | Record<string, unknown>
+      | undefined;
+    expect(details?.source).toBe("timer");
+    expect(details?.consecutiveQuotaFailures).toBe(1);
+    // First rung of the ladder: 15 minutes after the refusal (anchored on the
+    // failure's finish time, ~5 minutes before `now`), ±20% jitter.
+    const notBefore = new Date(String(details?.notBefore)).getTime();
+    expect(notBefore).toBeGreaterThan(now.getTime() + 5 * 60 * 1000);
+    expect(notBefore).toBeLessThan(now.getTime() + 20 * 60 * 1000);
+  });
+
+  it("escalates the provider-quota enqueue backoff with consecutive failures", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedQuotaBackoffFixture({ companyId, agentId, now, failureCount: 5 });
+
+    const tick = await heartbeat.tickTimers(now);
+
+    expect(tick.enqueued).toBe(0);
+    const skipRows = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "heartbeat.provider_quota_backoff"));
+    expect(skipRows).toHaveLength(1);
+    const details = (skipRows[0]?.payload as Record<string, unknown> | null)?.heartbeatSkip as
+      | Record<string, unknown>
+      | undefined;
+    expect(details?.consecutiveQuotaFailures).toBe(5);
+    // Max rung of the ladder: 6 hours after the refusal, ±20% jitter.
+    const notBefore = new Date(String(details?.notBefore)).getTime();
+    expect(notBefore).toBeGreaterThan(now.getTime() + 4 * 60 * 60 * 1000);
+    expect(notBefore).toBeLessThan(now.getTime() + 8 * 60 * 60 * 1000);
+  });
+
+  it("treats a pending scheduled quota retry as the next probe instead of enqueuing more wakes", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedQuotaBackoffFixture({ companyId, agentId, now, failureCount: 1 });
+    const scheduledRetryAt = new Date(now.getTime() + 20 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      status: "scheduled_retry",
+      scheduledRetryAt,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: { errorFamily: "provider_quota" },
+      updatedAt: now,
+      createdAt: new Date(now.getTime() - 30 * 1_000),
+    });
+
+    const tick = await heartbeat.tickTimers(now);
+
+    expect(tick.enqueued).toBe(0);
+    const skipRows = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "heartbeat.provider_quota_backoff"));
+    expect(skipRows).toHaveLength(1);
+    const details = (skipRows[0]?.payload as Record<string, unknown> | null)?.heartbeatSkip as
+      | Record<string, unknown>
+      | undefined;
+    expect(new Date(String(details?.notBefore)).toISOString()).toBe(scheduledRetryAt.toISOString());
+  });
+
+  it("resumes automatic wakes once the latest run is no longer a quota failure", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedQuotaBackoffFixture({ companyId, agentId, now, failureCount: 3 });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      status: "succeeded",
+      finishedAt: new Date(now.getTime() - 30 * 1_000),
+      resultJson: {},
+      contextSnapshot: {},
+      updatedAt: now,
+      createdAt: new Date(now.getTime() - 30 * 1_000),
+    });
+
+    const tick = await heartbeat.tickTimers(now);
+
+    expect(tick.enqueued).toBe(1);
+    const skipRows = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "heartbeat.provider_quota_backoff"));
+    expect(skipRows).toHaveLength(0);
+  });
+
+  it("still allows explicitly requested user wakes during the provider-quota backoff", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedQuotaBackoffFixture({ companyId, agentId, now, failureCount: 2 });
+
+    // System-driven assignment wakes stay deferred while the quota failure is
+    // the agent's most recent run.
+    const deferred = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      requestedByActorType: "system",
+      requestedByActorId: "recovery",
+      now,
+    });
+    expect(deferred).toBeNull();
+    const skipRows = await db
+      .select({ status: agentWakeupRequests.status, source: agentWakeupRequests.source })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "heartbeat.provider_quota_backoff"));
+    expect(skipRows).toHaveLength(1);
+    expect(skipRows[0]?.source).toBe("assignment");
+
+    // Explicitly requested user wakes are intentional and bounded, so they pass
+    // through the gate even while the backoff is active.
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual", {
+      actorType: "user",
+      actorId: "board-operator",
+    });
+    expect(run).not.toBeNull();
+  });
+
+  it("escalates provider-quota scheduled retries on the quota ladder, not the transient ladder", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: null,
+    });
+
+    // Fixed random sample of 0.5 yields a jitter multiplier of exactly 1, so
+    // the first scheduled retry is due precisely one ladder rung (15m) out.
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    const retryRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryAttempt).toBe(1);
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(
+      new Date(now.getTime() + PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS[0]).toISOString(),
+    );
+
+    // Attempt 2 climbs to the second rung (30m), not the transient ladder's 10m.
+    const scheduledSecond = await heartbeat.scheduleBoundedRetry(retryRun!.id, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduledSecond.outcome).toBe("scheduled");
+    const secondRetryRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, retryRun!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(secondRetryRun?.status).toBe("scheduled_retry");
+    expect(secondRetryRun?.scheduledRetryAttempt).toBe(2);
+    expect(secondRetryRun?.scheduledRetryAt?.toISOString()).toBe(
+      new Date(now.getTime() + PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS[1]).toISOString(),
+    );
   });
 
   async function seedMaxTurnFixture(input?: {

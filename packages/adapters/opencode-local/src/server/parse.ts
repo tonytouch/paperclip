@@ -19,11 +19,37 @@ function errorText(value: unknown): string {
   }
 }
 
+const OPEN_CODE_QUOTA_ERROR_TYPE_RE = /^provider\.quota$/i;
+const OPEN_CODE_QUOTA_MESSAGE_RE =
+  /(?:freeusagelimiterror|usage\s*limit|rate\s*limit|too\s*many\s+requests|\b429\b|quota\s*exceeded|exceeded\s+the\s+(?:models?|usage)\s+(?:quota|limit)|billing\s+detail)/i;
+
+/**
+ * Detect an upstream provider quota / rate-limit condition from an OpenCode
+ * `error` event. OpenCode surfaces these as `{ type: "provider.quota", status: 429,
+ * message: "Rate limit exceeded…" }`, often with a nested provider body such as
+ * `FreeUsageLimitError`. Classifying them (instead of a generic adapter failure)
+ * lets the heartbeat service apply provider-quota backoff rather than treating
+ * every occurrence as a hard failure.
+ */
+function isQuotaErrorEvent(error: unknown): boolean {
+  const rec = parseObject(error);
+  const type = asString(rec.type, "").trim();
+  if (OPEN_CODE_QUOTA_ERROR_TYPE_RE.test(type)) return true;
+  const status = asNumber(rec.status, 0);
+  if (status === 429) return true;
+  const message = errorText(error);
+  if (message && OPEN_CODE_QUOTA_MESSAGE_RE.test(message)) return true;
+  const response = parseObject(rec.response);
+  const body = asString(response.body, "").trim();
+  return Boolean(body && OPEN_CODE_QUOTA_MESSAGE_RE.test(body));
+}
+
 export function parseOpenCodeJsonl(stdout: string) {
   let sessionId: string | null = null;
   const messages: string[] = [];
   const errors: string[] = [];
   const toolErrors: string[] = [];
+  let quotaExceeded = false;
   const usage = {
     inputTokens: 0,
     cachedInputTokens: 0,
@@ -72,8 +98,10 @@ export function parseOpenCodeJsonl(stdout: string) {
     }
 
     if (type === "error") {
-      const text = errorText(event.error ?? event.message).trim();
+      const errorPayload = event.error ?? event.message;
+      const text = errorText(errorPayload).trim();
       if (text) errors.push(text);
+      if (isQuotaErrorEvent(errorPayload)) quotaExceeded = true;
       continue;
     }
   }
@@ -85,7 +113,24 @@ export function parseOpenCodeJsonl(stdout: string) {
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
+    quotaExceeded,
   };
+}
+
+/**
+ * Fallback quota detection for non-JSONL output (e.g. plain stderr). OpenCode
+ * quota failures may surface only as free text when the JSONL stream is not
+ * produced, so scan stderr/stdout before giving up.
+ */
+export function isOpenCodeQuotaError(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = [input.stdout, input.stderr, input.errorMessage]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n");
+  return Boolean(haystack) && OPEN_CODE_QUOTA_MESSAGE_RE.test(haystack);
 }
 
 export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): boolean {

@@ -306,6 +306,23 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+// Provider-quota enqueue backoff: when an agent's most recent run failed with a
+// `provider_quota` family (e.g. OpenCode Zen free-tier 429 / FreeUsageLimitError),
+// automatic wakes (interval timer, liveness recovery, stranded-issue
+// reassignment) back off on this escalating ladder instead of re-firing at the
+// normal cadence. This is the core mitigation that stops a quota exhaustion
+// from turning into ~150 doomed runs/day: recovery never self-amplifies because
+// each successive quota failure pushes the next wake further out, with jitter so
+// a fleet of agents does not stampede back the instant a window resets.
+export const PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS = [
+  15 * 60 * 1000,
+  30 * 60 * 1000,
+  2 * 60 * 60 * 1000,
+  4 * 60 * 60 * 1000,
+  6 * 60 * 60 * 1000,
+] as const;
+const PROVIDER_QUOTA_TIMER_BACKOFF_JITTER_RATIO = 0.2;
+const PROVIDER_QUOTA_TIMER_BACKOFF_MAX_INDEX = PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS.length - 1;
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 3;
@@ -383,7 +400,7 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
 }
 
 function readHeartbeatRunErrorFamily(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "error" | "resultJson">,
 ) {
   const resultJson = parseObject(run.resultJson);
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
@@ -394,6 +411,14 @@ function readHeartbeatRunErrorFamily(
   }
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
     return "transient_upstream";
+  }
+  // Generic adapter failures that are actually an upstream rate-limit refusal
+  // (the adapter returned `adapter_failed` with "Rate limit exceeded" text and
+  // no structured family). Classifying them here lets the quota-backoff enqueue
+  // gate and the scheduled-retry ladder engage, which is what actually breaks
+  // the self-amplifying 429 storm (TON-458).
+  if (isProviderQuotaRateLimitRun(run)) {
+    return "provider_quota";
   }
   return null;
 }
@@ -408,9 +433,18 @@ function isMaxTurnExhaustionRun(
   );
 }
 
-function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">) {
+function readTransientRetryNotBeforeFromRun(run: {
+  resultJson: unknown;
+  contextSnapshot?: unknown;
+}) {
   const resultJson = parseObject(run.resultJson);
-  const value = resultJson.retryNotBefore ?? resultJson.transientRetryNotBefore;
+  const contextSnapshot = parseObject(run.contextSnapshot);
+  const value =
+    resultJson.retryNotBefore ??
+    resultJson.transientRetryNotBefore ??
+    contextSnapshot.retryNotBefore ??
+    contextSnapshot.transientRetryNotBefore ??
+    contextSnapshot.providerQuotaRetryNotBefore;
   if (!(typeof value === "string" || typeof value === "number" || value instanceof Date)) {
     return null;
   }
@@ -419,9 +453,15 @@ function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$infe
 }
 
 function readTransientRecoveryContractFromRun(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "error" | "resultJson" | "contextSnapshot">,
 ) {
-  const errorFamily = readHeartbeatRunErrorFamily(run);
+  // A scheduled retry child run carries the failure family in its
+  // contextSnapshot (the source failure lives on the parent run), so fall back
+  // to it. Without this, the second provider-quota retry would silently drop
+  // back onto the faster transient ladder instead of the quota ladder.
+  const errorFamily =
+    readHeartbeatRunErrorFamily(run) ??
+    readNonEmptyString(parseObject(run.contextSnapshot).errorFamily);
   return errorFamily === "transient_upstream" || errorFamily === "provider_quota"
     ? {
         errorFamily,
@@ -450,6 +490,48 @@ function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown) 
 function isSpawnLikeFailureMessage(value: unknown) {
   if (typeof value !== "string") return false;
   return /failed to start command|spawn\b|\bENOENT\b/i.test(value);
+}
+
+// Rate-limit (429) detection for generic adapter failures. Local adapters
+// surface an upstream provider throttle as a plain `adapter_failed` run whose
+// only evidence is the human-readable error text (e.g. OpenCode Zen free-tier
+// returns "Rate limit exceeded. Please try again later." / a FreeUsageLimit
+// error). Those runs carry no structured `errorFamily`, so without this
+// classifier the quota-backoff enqueue gate never engages and every automatic
+// wake is a doomed probe that re-amplifies the failure storm (the ~150
+// adapter_failed/day we saw in TON-458). Only tight, unambiguous throttle
+// signals are treated as `provider_quota`; a broad pattern would wrongly
+// quarantine a genuinely broken adapter for hours.
+const RATE_LIMIT_ERROR_PATTERNS: ReadonlyArray<RegExp> = [
+  /rate[\s_-]*limit/i,
+  /too many requests/i,
+  /\b429\b/,
+  /quota\s+(?:exceeded|exhausted|hit)/i,
+  /usage\s+limit/i,
+  /free\s+usage\s+limit/i,
+  /exceeded\s+(?:your\s+)?(?:daily\s+)?(?:usage|quota)/i,
+];
+
+export function isProviderQuotaRateLimitMessage(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const text = value.trim();
+  if (!text) return false;
+  return RATE_LIMIT_ERROR_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function isProviderQuotaRateLimitRun(run: {
+  errorCode: string | null;
+  error: string | null;
+  resultJson: unknown;
+}): boolean {
+  if (run.errorCode === "provider_quota") return true;
+  if (isProviderQuotaRateLimitMessage(run.errorCode)) return true;
+  if (isProviderQuotaRateLimitMessage(run.error)) return true;
+  const resultJson = parseObject(run.resultJson);
+  return (
+    isProviderQuotaRateLimitMessage(resultJson.errorMessage) ||
+    isProviderQuotaRateLimitMessage(resultJson.message)
+  );
 }
 
 function isRetryableInteractionContinuationInfrastructureFailure(
@@ -994,6 +1076,32 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     delayMs,
     dueAt: new Date(now.getTime() + delayMs),
     maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+  };
+}
+
+/**
+ * Scheduled-retry ladder for `provider_quota` failures. A quota refusal (e.g.
+ * an exhausted OpenCode Zen free-tier daily quota) cannot recover within the
+ * transient ladder's minutes, so scheduled retries escalate on the same
+ * jittered ladder the enqueue gate uses: 15m → 30m → 2h → 4h → 6h.
+ */
+export function computeProviderQuotaHeartbeatRetrySchedule(
+  attempt: number,
+  now = new Date(),
+  random: () => number = Math.random,
+) {
+  if (!Number.isInteger(attempt) || attempt <= 0) return null;
+  const baseDelayMs = PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS[attempt - 1];
+  if (typeof baseDelayMs !== "number") return null;
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMultiplier = 1 + (((sample * 2) - 1) * PROVIDER_QUOTA_TIMER_BACKOFF_JITTER_RATIO);
+  const delayMs = Math.max(1_000, Math.round(baseDelayMs * jitterMultiplier));
+  return {
+    attempt,
+    baseDelayMs,
+    delayMs,
+    dueAt: new Date(now.getTime() + delayMs),
+    maxAttempts: PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS.length,
   };
 }
 
@@ -1996,6 +2104,10 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  // Optional clock override so deterministic callers (e.g. the timer tick that
+  // is handed a synthetic `now`) and tests evaluate time-based gates such as the
+  // provider-quota backoff against the caller's clock instead of wall time.
+  now?: Date;
 }
 
 type UsageTotals = {
@@ -5836,6 +5948,98 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * Provider-quota enqueue backoff resolver. If an agent's most recent run
+   * failed with a `provider_quota` family (e.g. an OpenCode Zen free-tier 429 /
+   * FreeUsageLimitError), return the earliest time an automatic wake (timer
+   * cadence, liveness recovery, stranded-issue reassignment) may dispatch that
+   * agent again. The delay escalates with the number of consecutive quota
+   * failures so an exhausted daily quota is not re-probed every heartbeat, and
+   * jitter keeps a fleet of agents from synchronizing their recovery. When a
+   * scheduled quota retry is already pending, its due time is the earliest
+   * automatic probe (it occupies the slot), so a fleet does not enqueue extra
+   * wakes around a retry that is about to fire anyway. Returns null when the
+   * agent is clear to wake on its normal cadence.
+   */
+  async function getProviderQuotaEnqueueBackoff(
+    agentId: string,
+    now: Date,
+    random: () => number = Math.random,
+  ): Promise<{ notBefore: Date; consecutiveQuotaFailures: number } | null> {
+    const [latest] = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        error: heartbeatRuns.error,
+        resultJson: heartbeatRuns.resultJson,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        finishedAt: heartbeatRuns.finishedAt,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1);
+    if (!latest) return null;
+
+    // A pending scheduled retry scheduled for a quota failure is the next
+    // deliberate probe; defer automatic wakes until it fires.
+    if (latest.status === "scheduled_retry") {
+      const pendingContext = parseObject(latest.contextSnapshot);
+      const pendingFamily = readNonEmptyString(pendingContext.errorFamily);
+      const pendingDueAt = latest.scheduledRetryAt;
+      if (pendingFamily === "provider_quota" && pendingDueAt) {
+        const due = new Date(pendingDueAt);
+        if (due.getTime() > now.getTime()) {
+          return {
+            notBefore: due,
+            consecutiveQuotaFailures: Math.max(latest.scheduledRetryAttempt ?? 1, 1),
+          };
+        }
+      }
+      return null;
+    }
+
+    if (latest.status !== "failed") return null;
+    if (readHeartbeatRunErrorFamily(latest) !== "provider_quota") return null;
+
+    // Count consecutive provider_quota failures walking back from the newest run.
+    const recent = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        error: heartbeatRuns.error,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS.length + 1);
+    let consecutiveQuotaFailures = 0;
+    for (const run of recent) {
+      if (run.status !== "failed" || readHeartbeatRunErrorFamily(run) !== "provider_quota") break;
+      consecutiveQuotaFailures += 1;
+    }
+    if (consecutiveQuotaFailures <= 0) return null;
+
+    const index = Math.min(consecutiveQuotaFailures - 1, PROVIDER_QUOTA_TIMER_BACKOFF_MAX_INDEX);
+    const baseDelayMs = PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS[index] ?? PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS[PROVIDER_QUOTA_TIMER_BACKOFF_MAX_INDEX];
+    const jitter = 1 + (random() * 2 - 1) * PROVIDER_QUOTA_TIMER_BACKOFF_JITTER_RATIO;
+    const delayMs = Math.max(0, Math.round(baseDelayMs * jitter));
+
+    // Anchor on the newest quota failure's completion (falling back to creation)
+    // so the backoff window reflects when the provider actually refused, not
+    // when the scheduler last happened to look.
+    const anchorMs = new Date(latest.finishedAt ?? latest.createdAt).getTime();
+    const notBefore = new Date(anchorMs + delayMs);
+    if (notBefore.getTime() <= now.getTime()) return null;
+    return { notBefore, consecutiveQuotaFailures };
+  }
+
   const issueMonitorDispatchColumns = {
     id: issues.id,
     companyId: issues.companyId,
@@ -8783,7 +8987,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const now = opts?.now ?? new Date();
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
-    const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS));
+    const transientRecovery =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
+        ? readTransientRecoveryContractFromRun(run)
+        : null;
+    // A provider-quota refusal (e.g. a daily free-tier quota) cannot recover in
+    // the transient ladder's minutes — probing at 2/10/30 minutes only burns
+    // bounded-retry budget against a provider that will refuse again. Escalate
+    // on the quota ladder instead (15m → 30m → 2h → 4h → 6h, jittered), the
+    // same ladder the enqueue gate uses, so every automatic retry path agrees
+    // on when the provider may have recovered.
+    const isProviderQuotaRetry = transientRecovery?.errorFamily === "provider_quota";
+    const defaultMaxAttempts = isProviderQuotaRetry
+      ? PROVIDER_QUOTA_TIMER_BACKOFF_DELAYS_MS.length
+      : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS;
+    const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? defaultMaxAttempts));
     const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
     const computedBaseSchedule = opts?.delayMs != null
       ? nextAttempt <= maxAttempts
@@ -8796,13 +9014,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : null
       : nextAttempt <= maxAttempts
-        ? computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
+        ? isProviderQuotaRetry
+          ? computeProviderQuotaHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
+          : computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
         : null;
     const baseSchedule = computedBaseSchedule ? { ...computedBaseSchedule, maxAttempts } : null;
-    const transientRecovery =
-      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
-        ? readTransientRecoveryContractFromRun(run)
-        : null;
     const codexTransientFallbackMode =
       agent.adapterType === "codex_local" && transientRecovery?.errorFamily === "transient_upstream"
         ? resolveCodexTransientFallbackMode(nextAttempt)
@@ -12885,7 +13101,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : outcome === "cancelled"
             ? (latestRun?.errorCode ?? "cancelled")
             : outcome === "failed"
-              ? (adapterResult.errorCode ?? recordedResponsibleUserDenialCode ?? "adapter_failed")
+              ? (isProviderQuotaRateLimitMessage(runErrorMessage)
+                  ? "provider_quota"
+                  : adapterResult.errorCode ?? recordedResponsibleUserDenialCode ?? "adapter_failed")
               : null;
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -13156,7 +13374,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         workspaceValidationFailure?.code
         ?? configurationIncompleteFailure?.code
         ?? recordedResponsibleUserDenialCode
-        ?? "adapter_failed";
+        ?? (isProviderQuotaRateLimitMessage(message) ? "provider_quota" : "adapter_failed");
       logger.error({ err, runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -14469,6 +14687,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (source !== "timer" && !policy.wakeOnDemand) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled");
       return null;
+    }
+
+    // Provider-quota backoff gate (TON-458). When this agent's most recent run
+    // was refused by the upstream provider quota (e.g. OpenCode Zen free-tier
+    // 429 / FreeUsageLimitError), any automatic wake — timer cadence,
+    // liveness recovery, or stranded-issue reassignment — is a doomed probe: it
+    // fails in milliseconds, burns bounded-retry budget, re-strands the issue,
+    // and (via the recovery-owner wake) re-amplifies the failure storm. Defer
+    // those wakes until the escalating jittered ladder allows another probe.
+    // Explicitly requested wakes (human on-demand invocations, issue mentions,
+    // interaction continuations) still pass through: they are intentional and
+    // bounded, and the fast quota refusal is the feedback the requester needs.
+    if (source !== "on_demand" && opts.requestedByActorType !== "user") {
+      const quotaBackoff = await getProviderQuotaEnqueueBackoff(agentId, opts.now ?? new Date());
+      if (quotaBackoff) {
+        await writeSkippedHeartbeatRequest("heartbeat.provider_quota_backoff", {
+          reason: `Automatic wake deferred until ${quotaBackoff.notBefore.toISOString()}: the agent's last ${quotaBackoff.consecutiveQuotaFailures} run(s) were refused by the upstream provider quota (429).`,
+          notBefore: quotaBackoff.notBefore.toISOString(),
+          consecutiveQuotaFailures: quotaBackoff.consecutiveQuotaFailures,
+          source,
+        });
+        return null;
+      }
     }
 
     const genericTimerWake =
@@ -15989,6 +16230,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reason: "heartbeat_timer",
           requestedByActorType: "system",
           requestedByActorId: "heartbeat_scheduler",
+          now,
           contextSnapshot: {
             source: "scheduler",
             reason: "interval_elapsed",
