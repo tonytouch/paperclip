@@ -399,7 +399,7 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
   return "fresh_session_safer_invocation";
 }
 
-function readHeartbeatRunErrorFamily(
+export function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "error" | "resultJson">,
 ) {
   const resultJson = parseObject(run.resultJson);
@@ -410,6 +410,13 @@ function readHeartbeatRunErrorFamily(
     return "provider_quota";
   }
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
+    return "transient_upstream";
+  }
+  // ACPX turn failures caused by an upstream transport interruption (dropped
+  // SSE stream, reset socket) are transient, not deterministic protocol
+  // faults. Without this the bounded retry ladder never engages and one
+  // dropped connection kills the run outright (TON-639).
+  if (run.errorCode === "acpx_transient_upstream") {
     return "transient_upstream";
   }
   // Generic adapter failures that are actually an upstream rate-limit refusal

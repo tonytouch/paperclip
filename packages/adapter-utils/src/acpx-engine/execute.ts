@@ -61,6 +61,7 @@ import {
   DEFAULT_ACP_ENGINE_TIMEOUT_SEC,
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "./constants.js";
+import { classifyTransientUpstreamFailure } from "./transient-upstream.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const WRAPPER_CLEANUP_RETENTION_MS = 15 * 60 * 1000;
@@ -1416,7 +1417,7 @@ function describeErrorDiagnostics(err: unknown): {
 function classifyError(
   err: unknown,
   phase?: AcpxExecutionPhase,
-): Pick<AdapterExecutionResult, "errorCode" | "errorMeta"> {
+): Pick<AdapterExecutionResult, "errorCode" | "errorFamily" | "errorMeta"> {
   const message = err instanceof Error ? err.message : String(err);
   const diagnostics = describeErrorDiagnostics(err);
   const { acpCode, errorName, causeMessage, retryable, stackPreview } = diagnostics;
@@ -1433,7 +1434,22 @@ function classifyError(
   if (authLike) {
     return {
       errorCode: "acpx_auth_required",
+      errorFamily: null,
       errorMeta: { category: "auth", ...baseMeta },
+    };
+  }
+  // An upstream transport interruption (dropped SSE stream, reset socket) is a
+  // transient fault, not a deterministic protocol error. Classify it as such so
+  // the heartbeat schedules a bounded retry instead of killing the run.
+  const transientUpstream =
+    classifyTransientUpstreamFailure(message) ??
+    classifyTransientUpstreamFailure(causeMessage) ??
+    null;
+  if (transientUpstream) {
+    return {
+      errorCode: transientUpstream.errorCode,
+      errorFamily: transientUpstream.errorFamily,
+      errorMeta: { category: "transient", ...baseMeta },
     };
   }
   const phaseCode = (() => {
@@ -1449,17 +1465,20 @@ function classifyError(
   if (phaseCode) {
     return {
       errorCode: phaseCode,
+      errorFamily: null,
       errorMeta: { category: acpCode ? "protocol" : "runtime", ...baseMeta },
     };
   }
   if (acpCode) {
     return {
       errorCode: "acpx_protocol_error",
+      errorFamily: null,
       errorMeta: { category: "protocol", ...baseMeta },
     };
   }
   return {
     errorCode: "acpx_runtime_error",
+    errorFamily: null,
     errorMeta: { category: "runtime", ...baseMeta },
   };
 }
@@ -1497,7 +1516,7 @@ async function emitAcpxFailure(input: {
   // adapter execution timeout message instead of the raw underlying error.
   messageOverride?: string;
 }): Promise<{
-  classified: Pick<AdapterExecutionResult, "errorCode" | "errorMeta">;
+  classified: Pick<AdapterExecutionResult, "errorCode" | "errorFamily" | "errorMeta">;
   message: string;
   childStderrTail: string | null;
 }> {
@@ -1908,12 +1927,26 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         stopReason: terminalStopReason,
         message: errorMessage,
       });
+      // A turn that dies because the upstream stream was cut mid-response
+      // ("Connection closed mid-response", a reset socket, an overloaded
+      // upstream) is transient: the same prompt normally succeeds on a fresh
+      // session. Reporting it as a deterministic `acpx_turn_failed` made the
+      // heartbeat treat it as non-retryable, so a single dropped connection
+      // killed the whole run with no recovery (TON-639).
+      const terminalTransientUpstream =
+        terminal.status === "failed"
+          ? (classifyTransientUpstreamFailure(terminalStopReason) ??
+            classifyTransientUpstreamFailure(errorMessage))
+          : null;
       return {
         exitCode: terminal.status === "completed" ? 0 : 1,
         signal: timedOut ? "SIGTERM" : null,
         timedOut,
         errorMessage,
-        errorCode: terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null,
+        errorCode:
+          terminalTransientUpstream?.errorCode ??
+          (terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null),
+        errorFamily: terminalTransientUpstream?.errorFamily ?? null,
         sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
         sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
         sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -1931,7 +1964,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           fastMode: prepared.fastMode,
         },
         summary: textParts.join("").trim() || terminalStopReason || terminal.status,
-        clearSession,
+        // The upstream stream was cut mid-response, so the session's last
+        // assistant message is truncated. Resuming it would replay the same
+        // broken turn, so drop the session and let the retry start clean.
+        clearSession: clearSession || Boolean(terminalTransientUpstream),
       };
     } catch (err) {
       if (timeout) clearTimeout(timeout);
@@ -1965,6 +2001,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         timedOut,
         errorMessage: message,
         errorCode: timedOut ? "acpx_timeout" : classified.errorCode,
+        errorFamily: classified.errorFamily ?? null,
         errorMeta: classified.errorMeta,
         provider: "acpx",
         model: prepared.requestedModel || null,
