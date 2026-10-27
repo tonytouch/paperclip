@@ -965,6 +965,10 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  "heartbeat.daily_run_limit",
+  "heartbeat.daily_cost_limit",
+  "heartbeat.scheduling_suppressed",
+  "heartbeat.provider_quota_backoff",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([

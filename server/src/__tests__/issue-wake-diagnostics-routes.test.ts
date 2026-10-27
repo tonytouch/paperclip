@@ -267,6 +267,47 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(serialized).not.toContain("\"error\"");
   });
 
+  it("reports the daily-run-cap skip reason verbatim instead of flattening it to 'other'", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Capped agent issue",
+      status: "todo",
+      assigneeAgentId: agent.id,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "automation",
+      reason: "heartbeat.daily_run_limit",
+      status: "skipped",
+      payload: {
+        issueId: issue.id,
+        heartbeatSkip: { limit: 12, observed: 12 },
+      },
+      requestedAt: new Date(Date.now() - 10_000),
+      finishedAt: new Date(Date.now() - 9_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      reason: "heartbeat.daily_run_limit",
+      status: "skipped",
+      failureClass: "skipped",
+    });
+    expect(res.body.diagnosis).toContain("heartbeat.daily_run_limit");
+    expect(res.body.diagnosis).not.toContain("other");
+  });
+
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");
@@ -276,7 +317,6 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       title: "Quiet issue",
       status: "todo",
     });
-
     const res = await request(createApp(db, boardActor(company)))
       .get(`/api/issues/${issue.id}/diagnostics/wakes`);
 
