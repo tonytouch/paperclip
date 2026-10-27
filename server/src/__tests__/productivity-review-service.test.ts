@@ -8,7 +8,9 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issues,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -16,9 +18,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
+  DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS,
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+  DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   productivityReviewService,
@@ -266,7 +270,9 @@ describeEmbeddedPostgres("productivity review service", () => {
       now,
     });
     await db.insert(issues).values(
-      [8, 9, 10].map((hoursAgo, index) => {
+      // Older than the resolved-review snooze window so this exercises the creation cap
+      // rather than the snooze.
+      [13, 14, 15].map((hoursAgo, index) => {
         const createdAt = new Date(now.getTime() - hoursAgo * 60 * 60 * 1000);
         return {
           id: randomUUID(),
@@ -562,5 +568,201 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  it("does not trip long_active_duration while the source issue has a live continuation path", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const service = productivityReviewService(db);
+
+    const scenarios: Array<{
+      label: string;
+      seed: (seeded: Awaited<ReturnType<typeof seedAssignedIssue>>) => Promise<void>;
+    }> = [
+      {
+        label: "armed monitor",
+        seed: async (seeded) => {
+          await db
+            .update(issues)
+            .set({ monitorNextCheckAt: new Date(now.getTime() + 60 * 60 * 1000) })
+            .where(eq(issues.id, seeded.issueId));
+        },
+      },
+      {
+        label: "armed monitor in the execution policy",
+        seed: async (seeded) => {
+          await db
+            .update(issues)
+            .set({
+              executionPolicy: {
+                monitor: { nextCheckAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString() },
+              },
+            })
+            .where(eq(issues.id, seeded.issueId));
+        },
+      },
+      {
+        label: "open descendant",
+        seed: async (seeded) => {
+          await db.insert(issues).values({
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            title: "Follow-up child",
+            status: "in_progress",
+            priority: "medium",
+            assigneeAgentId: seeded.coderId,
+            parentId: seeded.issueId,
+            issueNumber: 2,
+            identifier: `${seeded.issuePrefix}-2`,
+            startedAt: now,
+            createdAt: now,
+            updatedAt: now,
+          });
+        },
+      },
+      {
+        label: "active routine",
+        seed: async (seeded) => {
+          await db.insert(routines).values({
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            title: "Daily watch",
+            status: "active",
+            assigneeAgentId: seeded.coderId,
+            parentIssueId: seeded.issueId,
+            variables: [],
+          });
+        },
+      },
+      {
+        label: "pending interaction",
+        seed: async (seeded) => {
+          await db.insert(issueThreadInteractions).values({
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            issueId: seeded.issueId,
+            kind: "ask_user_questions",
+            status: "pending",
+            continuationPolicy: "wake_assignee",
+            payload: {
+              version: 1,
+              title: "Which lane?",
+              questions: [
+                {
+                  id: "q1",
+                  prompt: "Which lane should run next?",
+                  selectionMode: "single",
+                  options: [
+                    { id: "a", label: "Lane A" },
+                    { id: "b", label: "Lane B" },
+                  ],
+                },
+              ],
+            },
+            createdAt: now,
+            updatedAt: now,
+          });
+        },
+      },
+      {
+        label: "live execution run",
+        seed: async (seeded) => {
+          const runId = randomUUID();
+          await db.insert(heartbeatRuns).values({
+            id: runId,
+            companyId: seeded.companyId,
+            agentId: seeded.coderId,
+            status: "running",
+            invocationSource: "assignment",
+            triggerDetail: "system",
+            startedAt: now,
+            contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+            livenessState: "advanced",
+            nextAction: "Continue processing the next batch.",
+            createdAt: now,
+            updatedAt: now,
+          });
+          await db
+            .update(issues)
+            .set({ executionRunId: runId })
+            .where(eq(issues.id, seeded.issueId));
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      });
+      await scenario.seed(seeded);
+
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const reviews = await listProductivityReviews(seeded.companyId);
+
+      expect({ scenario: scenario.label, created: result.created }).toEqual({
+        scenario: scenario.label,
+        created: 0,
+      });
+      expect({ scenario: scenario.label, reviews: reviews.length }).toEqual({
+        scenario: scenario.label,
+        reviews: 0,
+      });
+    }
+  });
+
+  it("still trips long_active_duration when the source issue has no continuation path", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+    const reviews = await listProductivityReviews(seeded.companyId);
+
+    expect(result.created).toBe(1);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("keeps the resolved-review snooze longer than the long-active threshold", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    expect(DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS).toBeGreaterThan(
+      DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
+    );
+
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toBeTruthy();
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: now })
+      .where(eq(issues.id, review!.id));
+
+    // Past the long-active threshold (6h) but still inside the snooze window (12h):
+    // the resolved review must suppress a re-review.
+    const insideSnooze = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + 7 * 60 * 60 * 1000),
+      companyId: seeded.companyId,
+    });
+    expect(insideSnooze.snoozed).toBe(1);
+    expect(insideSnooze.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+
+    // Past the snooze window the review may be re-created.
+    const afterSnooze = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS + 60 * 60 * 1000),
+      companyId: seeded.companyId,
+    });
+    expect(afterSnooze.created).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(2);
   });
 });

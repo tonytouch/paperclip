@@ -7,8 +7,10 @@ import {
   costEvents,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issues,
   projects,
+  routines,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
@@ -26,7 +28,10 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
-export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000;
+// The resolved-review snooze MUST be strictly longer than the long-active trigger
+// interval. When the two are equal, closing a review as "productive" is a guaranteed
+// no-op: the trigger re-arms at exactly the moment the snooze expires.
+export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 12 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -34,6 +39,9 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 3;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+// Issue statuses that mean the work is finished. A descendant in any other status
+// is still an open unit of work under the source issue.
+const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
@@ -103,6 +111,20 @@ function issueRunScopeSql(issueId: string) {
     or ${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueId}
     or ${heartbeatRuns.contextSnapshot}->>'taskKey' = ${issueId}
   )`;
+}
+
+/**
+ * Reads `executionPolicy.monitor.nextCheckAt` out of the untyped jsonb column.
+ * The monitor is "armed" when the check is still in the future.
+ */
+export function readExecutionPolicyMonitorNextCheckAt(policy: unknown): Date | null {
+  if (!policy || typeof policy !== "object") return null;
+  const monitor = (policy as Record<string, unknown>).monitor;
+  if (!monitor || typeof monitor !== "object") return null;
+  const raw = (monitor as Record<string, unknown>).nextCheckAt;
+  if (raw === null || raw === undefined) return null;
+  const parsed = raw instanceof Date ? raw : new Date(typeof raw === "string" || typeof raw === "number" ? raw : NaN);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function msToHuman(ms: number | null) {
@@ -381,6 +403,93 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  /**
+   * A source issue is only "stuck" when nothing is carrying it forward. An issue with a
+   * live continuation path (armed monitor, open descendant, active routine, pending
+   * interaction, or an in-flight execution/checkout run) is being advanced by something
+   * else, so the `long_active_duration` trigger must not fire on it.
+   */
+  async function findLiveContinuationPath(
+    sourceIssue: Pick<IssueRow, "id" | "companyId" | "monitorNextCheckAt" | "executionPolicy" | "executionRunId" | "checkoutRunId">,
+    now: Date,
+  ): Promise<{ live: boolean; reason: string | null }> {
+    if (sourceIssue.monitorNextCheckAt && sourceIssue.monitorNextCheckAt.getTime() > now.getTime()) {
+      return { live: true, reason: "armed monitor" };
+    }
+    const policyCheckAt = readExecutionPolicyMonitorNextCheckAt(sourceIssue.executionPolicy);
+    if (policyCheckAt && policyCheckAt.getTime() > now.getTime()) {
+      return { live: true, reason: "armed monitor (execution policy)" };
+    }
+    if (sourceIssue.executionRunId || sourceIssue.checkoutRunId) {
+      return { live: true, reason: "live execution run" };
+    }
+
+    const [pendingInteraction, activeRoutine, liveDescendant] = await Promise.all([
+      db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, sourceIssue.companyId),
+            eq(issueThreadInteractions.issueId, sourceIssue.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: routines.id })
+        .from(routines)
+        .where(
+          and(
+            eq(routines.companyId, sourceIssue.companyId),
+            eq(routines.parentIssueId, sourceIssue.id),
+            eq(routines.status, "active"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      findLiveDescendant(sourceIssue),
+    ]);
+
+    if (pendingInteraction) return { live: true, reason: "pending interaction" };
+    if (activeRoutine) return { live: true, reason: "active routine" };
+    if (liveDescendant) return { live: true, reason: "open descendant" };
+    return { live: false, reason: null };
+  }
+
+  /**
+   * Walks the descendant tree of a source issue and returns the first descendant that is
+   * still open. Productivity-review children are excluded: a review is the output of this
+   * detector, not a continuation path for the source issue.
+   */
+  async function findLiveDescendant(sourceIssue: Pick<IssueRow, "id" | "companyId">) {
+    const seen = new Set<string>([sourceIssue.id]);
+    let frontier = [sourceIssue.id];
+    for (let depth = 0; depth < MAX_PARENT_WALK_DEPTH && frontier.length > 0; depth += 1) {
+      const children = await db
+        .select({ id: issues.id, status: issues.status, originKind: issues.originKind })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, sourceIssue.companyId),
+            inArray(issues.parentId, frontier),
+            visibleIssueCondition(),
+          ),
+        )
+        .limit(500);
+      const live = children.find(
+        (child) =>
+          child.originKind !== PRODUCTIVITY_REVIEW_ORIGIN_KIND &&
+          !TERMINAL_ISSUE_STATUSES.includes(child.status as (typeof TERMINAL_ISSUE_STATUSES)[number]),
+      );
+      if (live) return live;
+      frontier = children.map((child) => child.id).filter((id) => !seen.has(id));
+      for (const id of frontier) seen.add(id);
+    }
+    return null;
+  }
+
   async function collectEvidence(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
@@ -477,7 +586,12 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const continuationPath = await findLiveContinuationPath(sourceIssue, now);
+    const longActiveByAge = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // `startedAt` is the age of the current active episode, not the age of the last
+    // progress. An issue that is being advanced by a live continuation path is healthy,
+    // so the age-based trigger must not fire on it.
+    const longActive = longActiveByAge && !continuationPath.live;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
@@ -489,6 +603,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const triggerReasons: string[] = [];
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
+    if (longActiveByAge && continuationPath.live) {
+      triggerReasons.push(
+        `long-active trigger suppressed: live continuation path (${continuationPath.reason})`,
+      );
+    }
     if (highChurn) {
       triggerReasons.push(
         `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
