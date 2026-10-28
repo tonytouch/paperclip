@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# TON-814 - refuse a checkout that would leave the deployed tree without the
+# productivity-review fix.
+#
+# `git checkout upstream/master` (or `git checkout origin/master` before the
+# remote is renamed) removes server/src/services/productivity-review.ts and the
+# long_active_duration fix in a single move. This hook catches that at the
+# moment it happens and puts the operator back on the durable branch.
+
+set -uo pipefail
+
+SERVICE="server/src/services/productivity-review.ts"
+TESTFILE="server/src/__tests__/productivity-review-service.test.ts"
+MARKER="findLiveContinuationPath"
+DURABLE="fork/ton/deployed-long-active-fix"
+
+# previous HEAD, new HEAD, and the branch flag (1 = branch checkout)
+previous_head="${1:-}"
+new_head="${2:-}"
+is_branch="${3:-0}"
+
+# Only branch checkouts move the tree in a way that matters here.
+if [ "$is_branch" != "1" ]; then
+  exit 0
+fi
+
+for path in "$SERVICE" "$TESTFILE"; do
+  if [ ! -f "$path" ]; then
+    echo "post-checkout: REFUSING the checkout." >&2
+    echo "  $path does not exist on the target branch." >&2
+    echo "  Upstream deleted the productivity-review feature (3bafac12f); the" >&2
+    echo "  long_active_duration fix (fa3c22dd) exists only on $DURABLE." >&2
+    echo "  The working tree has been left as-is - run:" >&2
+    echo "    git checkout $DURABLE" >&2
+    exit 1
+  fi
+done
+
+if ! grep -q "$MARKER" "$SERVICE" 2>/dev/null; then
+  echo "post-checkout: REFUSING the checkout." >&2
+  echo "  $SERVICE on the target branch does not contain the $MARKER fix." >&2
+  echo "  Run: git checkout $DURABLE" >&2
+  exit 1
+fi
+
+exit 0

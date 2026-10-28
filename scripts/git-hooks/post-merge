@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# TON-814 - self-heal after a merge that dropped the productivity-review fix.
+#
+# The pre-merge-commit hook blocks the destructive merge before it is
+# committed, but a fast-forward `git pull` never creates a merge commit and
+# therefore never runs it. This hook is the net under that path: it runs after
+# every merge (including fast-forwards) and restores the fix files from the
+# durable fork branch if they went missing.
+
+set -uo pipefail
+
+SERVICE="server/src/services/productivity-review.ts"
+TESTFILE="server/src/__tests__/productivity-review-service.test.ts"
+MARKER="findLiveContinuationPath"
+DURABLE="fork/ton/deployed-long-active-fix"
+
+restore_from_durable() {
+  git fetch --quiet fork "$DURABLE" 2>/dev/null || return 1
+  git checkout "$DURABLE" -- "$SERVICE" "$TESTFILE" 2>/dev/null || return 1
+  return 0
+}
+
+missing=0
+for path in "$SERVICE" "$TESTFILE"; do
+  if [ ! -f "$path" ]; then
+    missing=1
+  fi
+done
+
+if [ "$missing" -eq 0 ] && ! grep -q "$MARKER" "$SERVICE" 2>/dev/null; then
+  missing=1
+fi
+
+if [ "$missing" -eq 1 ]; then
+  echo "post-merge: the productivity-review fix is MISSING after this merge." >&2
+  echo "post-merge: restoring $SERVICE and $TESTFILE from $DURABLE." >&2
+  if restore_from_durable; then
+    echo "post-merge: restored. The files are staged but NOT committed -" >&2
+    echo "post-merge: commit them, or 'git merge --abort' and redeploy from $DURABLE." >&2
+    exit 1
+  fi
+  echo "post-merge: RESTORE FAILED. Redeploy from the durable branch:" >&2
+  echo "post-merge:   git fetch fork && git checkout fork/ton/deployed-long-active-fix" >&2
+  exit 1
+fi
+
+exit 0

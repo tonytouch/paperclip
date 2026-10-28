@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# TON-814 - never push to upstream paperclipai/paperclip.
+#
+# Upstream denies pushes to this fork, and the productivity-review feature we
+# depend on was deleted upstream (3bafac12f). A push can only ever be a
+# no-op error upstream, but it also risks pushing a branch that would make the
+# deployed tree's source of truth ambiguous. Refuse it loudly instead.
+
+set -uo pipefail
+
+remote="${1:-}"
+if [ "$remote" = "origin" ] || [ "$remote" = "upstream" ]; then
+  echo "pre-push: REFUSING to push to '$remote'." >&2
+  echo "  The durable branch for the deployed paperclip tree is" >&2
+  echo "  fork/ton/deployed-long-active-fix (remote 'fork')." >&2
+  echo "  Upstream has deleted the productivity-review feature; do not push there." >&2
+  exit 1
+fi
+
+exit 0
