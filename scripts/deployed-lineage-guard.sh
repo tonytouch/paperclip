@@ -38,7 +38,7 @@ FORBIDDEN_URL_PATTERN="${PAPERCLIP_FORBIDDEN_URL_PATTERN:-paperclipai/paperclip}
 SERVICE="server/src/services/productivity-review.ts"
 TESTFILE="server/src/__tests__/productivity-review-service.test.ts"
 MARKER="findLiveContinuationPath"
-HOOK_NAMES="pre-merge-commit post-merge post-checkout pre-push"
+HOOK_NAMES="pre-commit pre-merge-commit post-merge post-checkout pre-push"
 GUARD_ASSETS="scripts/deployed-lineage-guard.sh scripts/paperclip-deploy-check.sh scripts/install-deployed-lineage-guard.sh scripts/redeploy-paperclip.sh"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -62,7 +62,6 @@ echo "[$(ts)] deployed-lineage-guard: repo=$REPO branch=$branch upstream=$upstre
 #    pull can delete the service. We check the remote URL, not just its name,
 #    so a clone that calls the fork 'origin' is judged on the same merits.
 case "$upstream" in
-  "$DURABLE_REMOTE/$DURABLE_BRANCH") ;;
   */*)
     up_remote="${upstream%%/*}"
     up_branch="${upstream#*/}"

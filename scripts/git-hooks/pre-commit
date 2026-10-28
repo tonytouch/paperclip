@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# TON-814 - refuse a commit that would delete the productivity-review service
+# or revert the long_active_duration fix.
+#
+# WHY pre-commit AND NOT ONLY pre-merge-commit
+#   Upstream (paperclipai/paperclip) deleted the productivity-review feature in
+#   3bafac12f, and the long_active_duration fix (fa3c22dd) exists only on our
+#   fork branch ton/deployed-long-active-fix. Merging upstream master into the
+#   deployed tree ALWAYS conflicts on the service (modify/delete), so `git merge`
+#   aborts without creating a commit and `pre-merge-commit` NEVER RUNS. The
+#   operator then resolves the conflict - most naturally by accepting upstream's
+#   deletion - and commits. That commit is an ordinary `git commit`, so the hook
+#   that actually guards it is `pre-commit`.
+#
+#   Measured in a scratch clone of the fork: `git merge upstream/master` exits 1
+#   with "CONFLICT (modify/delete): server/src/services/productivity-review.ts
+#   deleted in upstream/master"; the subsequent `git commit` then deleted the
+#   service with no hook in the way. This hook closes that path.
+#
+# WHAT IT BLOCKS
+#   - a commit whose tree lacks server/src/services/productivity-review.ts
+#   - a commit whose tree lacks the service's test file
+#   - a commit whose tree keeps the service but drops the findLiveContinuationPath
+#     fix (the file survives, the fix is reverted - the silent case)
+#
+# This hook is a guard on the DEPLOYED tree only. It is idempotent, side-effect
+# free, and aborts the commit before it is written.
+
+set -uo pipefail
+
+SERVICE="server/src/services/productivity-review.ts"
+TESTFILE="server/src/__tests__/productivity-review-service.test.ts"
+MARKER="findLiveContinuationPath"
+
+refuse() {
+  echo "pre-commit: REFUSING the commit." >&2
+  echo "  $1" >&2
+  echo "  Upstream (paperclipai/paperclip) removed the productivity-review feature" >&2
+  echo "  in 3bafac12f; the long_active_duration fix (fa3c22dd) exists only on" >&2
+  echo "  fork/ton/deployed-long-active-fix." >&2
+  echo "  Deploy from the durable branch instead:" >&2
+  echo "    git fetch fork && git checkout fork/ton/deployed-long-active-fix" >&2
+  exit 1
+}
+
+# The index is what the commit would contain.
+if ! git cat-file -e ":$SERVICE" 2>/dev/null; then
+  refuse "$SERVICE would be deleted by this commit."
+fi
+if ! git cat-file -e ":$TESTFILE" 2>/dev/null; then
+  refuse "$TESTFILE would be deleted by this commit."
+fi
+
+# The file can survive while the fix inside it is reverted.
+if ! git show ":$SERVICE" 2>/dev/null | grep -q "$MARKER"; then
+  refuse "$SERVICE would lose the $MARKER fix in this commit."
+fi
+
+exit 0

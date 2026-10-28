@@ -15,7 +15,7 @@ set -uo pipefail
 REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}"
 UNIT_DIR="${HOME}/.config/systemd/user"
 GUARD_DIR="${HOME}/.local/share/paperclip-guard"
-HOOK_NAMES="pre-merge-commit post-merge post-checkout pre-push"
+HOOK_NAMES="pre-commit pre-merge-commit post-merge post-checkout pre-push"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 

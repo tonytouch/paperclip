@@ -17,6 +17,12 @@ The unit `paperclip.service` runs the TypeScript **source** through `tsx`
 (`cli/src/index.ts run`), so the working tree *is* the running program. A restart is a deploy,
 and a bad pull is a silent, catastrophic regression that no test in this tree can catch.
 
+Note the unit is a **systemd _user_** unit (`systemctl --user`, `~/.config/systemd/user/`),
+not a system unit - `systemctl status paperclip.service` (without `--user`) reports
+"could not be found" and is misleading. It runs from `WorkingDirectory=%h/.paperclip` with
+`ExecStart` pointing at `~/tonysplace_best/workspace/paperclip/cli/src/index.ts`, so the
+deployed tree is the one serving on `127.0.0.1:3100`.
+
 ## Deploy source of truth
 
 | | |
@@ -24,7 +30,7 @@ and a bad pull is a silent, catastrophic regression that no test in this tree ca
 | Deployed tree | `/home/tony/tonysplace_best/workspace/paperclip` |
 | Deployed branch | `ton/ton-809-manager-boundary` |
 | Tracked upstream | `fork/ton/deployed-long-active-fix` ✅ |
-| Durable remote | `fork` = `https://github.com/tonytouch/paperclip.git` |
+| Durable remote | `fork` = `https://github.com/tonytouch/paperclip.git` (judged by **URL**, not by name) |
 | `origin` | `https://github.com/paperclipai/paperclip.git` — **upstream, never deploy from it** |
 
 `git pull` in the deployed tree pulls **from the fork's durable branch**, which carries the fix.
@@ -61,7 +67,10 @@ Variants: `--check-only` (verify, mutate nothing) · `--no-restart` (redeploy th
 `scripts/deployed-lineage-guard.sh` (installed at `~/.local/share/paperclip-guard/`, run hourly by
 the `paperclip-guard-deployed-lineage.timer` systemd user timer) fails closed on any of:
 
-1. the deployed branch not tracking `fork/ton/deployed-long-active-fix`;
+1. the deployed branch not tracking the durable branch, or tracking one on a remote whose
+   **URL** is not our fork. The remote's local *name* is not the invariant - a clone that
+   calls the fork `origin` is judged on the same merits, and a remote named `fork` that
+   points at `paperclipai/paperclip` is rejected;
 2. `fa3c22dd` not an ancestor of deployed HEAD;
 3. the service or its test absent from the deployed branch tree;
 4. either file absent from the working tree;
@@ -76,10 +85,30 @@ the `paperclip-guard-deployed-lineage.timer` systemd user timer) fails closed on
 
 | Hook | Blocks |
 |---|---|
+| `pre-commit` | **the load-bearing one** - any commit whose tree would delete the service, delete its test, or drop the `findLiveContinuationPath` fix |
 | `pre-merge-commit` | a merge whose result would delete the service or drop the `findLiveContinuationPath` fix |
 | `post-merge` | self-heals after a fast-forward pull that dropped the files (a FF pull creates no merge commit, so `pre-merge-commit` never runs) |
 | `post-checkout` | a branch checkout that would leave the tree without the service |
 | `pre-push` | any push to `origin` / `upstream` |
+
+### Why `pre-commit` is the one that actually fires
+
+`pre-merge-commit` is **not** sufficient on its own, and this was measured, not assumed.
+Merging upstream master into the deployed tree always conflicts on the service:
+
+```
+CONFLICT (modify/delete): server/src/services/productivity-review.ts deleted in upstream/master
+```
+
+So `git merge` exits 1 and creates **no commit** - which means `pre-merge-commit` never
+runs. The operator then resolves the conflict (most naturally by accepting upstream's
+deletion) and runs an ordinary `git commit`, which invokes `pre-commit` and nothing else.
+Before `pre-commit` existed, that path deleted the service with nothing in the way
+(reproduced in a scratch clone of the fork). `pre-commit` now refuses it.
+
+`pre-commit` is deliberately narrow: it inspects the **index** and refuses only when the
+service file, its test, or the `findLiveContinuationPath` marker would be lost. An
+unrelated commit in the deployed tree is unaffected.
 
 Reinstall them (idempotent) with:
 
