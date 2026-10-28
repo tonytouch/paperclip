@@ -64,6 +64,14 @@ Variants: `--check-only` (verify, mutate nothing) · `--no-restart` (redeploy th
 
 ## The guard
 
+The guard and its installer both operate on **the tree they live in** (derived from
+their own location), not on a hardcoded path. This matters: a hardcoded path meant a
+guard run from a fresh clone validated the *deployed* tree and reported OK on a broken
+clone, and an installer run from a fresh clone armed the *deployed* tree's hooks instead
+of the clone's. Both are fixed; the installer additionally writes the systemd timer and
+the installed guard runner only for the deployed tree, so running it from a scratch clone
+arms that clone's hooks and leaves the hourly timer pointing at the deployed tree.
+
 `scripts/deployed-lineage-guard.sh` (installed at `~/.local/share/paperclip-guard/`, run hourly by
 the `paperclip-guard-deployed-lineage.timer` systemd user timer) fails closed on any of:
 
