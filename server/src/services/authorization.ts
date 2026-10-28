@@ -1520,6 +1520,29 @@ export function authorizationService(db: Db) {
           });
         }
       }
+      // `permissionForAction` deliberately maps the protected-change actions to a
+      // null permission key because they are gated by their own grant pairs
+      // (agents:configure / agents:suggest-changes and the skill equivalents)
+      // rather than by a single key. That means the `!permissionKey` fallback
+      // below would deny them with "No board permission mapping exists for
+      // <action>" before the grant logic ever ran, leaving the board-side
+      // mapping dead code. Resolve those actions first so a board principal
+      // that holds the grant is actually authorized.
+      if (input.action === "agent_config:read") {
+        return decideWithAgentConfigReadGrant("user", input.actor.userId);
+      }
+      if (input.action === "agent_config:update") {
+        return decideWithProtectedChangeGrants("user", input.actor.userId, {
+          direct: "agents:configure",
+          suggest: "agents:suggest-changes",
+        });
+      }
+      if (input.action === "skill_config:update") {
+        return decideWithProtectedChangeGrants("user", input.actor.userId, {
+          direct: "skills:create",
+          suggest: "skills:suggest-changes",
+        });
+      }
       if (!permissionKey) {
         if (
           input.action === "agent:read" ||
@@ -1566,21 +1589,6 @@ export function authorizationService(db: Db) {
         const policyEffect = taskAssignmentPolicyEffect ?? await assignmentPolicyEffect(input.resource);
         if (policyEffect.kind === "restricted") return denyRestrictedAssignmentPolicy(policyEffect);
         return grantDecision;
-      }
-      if (input.action === "agent_config:read") {
-        return decideWithAgentConfigReadGrant("user", input.actor.userId);
-      }
-      if (input.action === "agent_config:update") {
-        return decideWithProtectedChangeGrants("user", input.actor.userId, {
-          direct: "agents:configure",
-          suggest: "agents:suggest-changes",
-        });
-      }
-      if (input.action === "skill_config:update") {
-        return decideWithProtectedChangeGrants("user", input.actor.userId, {
-          direct: "skills:create",
-          suggest: "skills:suggest-changes",
-        });
       }
       return decidePrincipalGrant({
         companyId,
@@ -1645,16 +1653,17 @@ export function authorizationService(db: Db) {
       if (taskBridgeDecision) return taskBridgeDecision;
     }
 
+    const trustResolution = await resolveActorTrust({
+      actorAgent,
+      actor: input.actor,
+      companyId,
+      resource: input.resource,
+    });
     const lowTrustDecision = await decideLowTrustAccess({
       actorAgentId,
       action: input.action,
       resource: input.resource,
-      resolution: await resolveActorTrust({
-        actorAgent,
-        actor: input.actor,
-        companyId,
-        resource: input.resource,
-      }),
+      resolution: trustResolution,
     });
     if (lowTrustDecision) {
       if (!lowTrustDecision.allowed) return lowTrustDecision;
@@ -1753,6 +1762,27 @@ export function authorizationService(db: Db) {
         })
       ) {
         return allowIssueMentionGrant(input.action);
+      }
+      // Manager chain: an agent that manages the issue assignee in the reporting
+      // chain may comment on and mutate the assignee's issues. This mirrors the
+      // `allow_manager_chain` rule already used for `tasks:manage_active_checkouts`,
+      // so the two manager-scoped powers cannot disagree about who manages whom.
+      // The mention-grant rule above keeps priority: a mentioned peer that also
+      // manages the assignee keeps its narrower comment-only grant.
+      //
+      // Low-trust actors are excluded: their preset deliberately fences them to a
+      // narrow boundary, and a reporting relationship must not widen that fence.
+      if (
+        trustResolution.kind === "standard" &&
+        resource?.assigneeAgentId &&
+        resource.assigneeAgentId !== actorAgentId &&
+        await isManagerOf(companyId, actorAgentId, resource.assigneeAgentId)
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
+        });
       }
     }
     if (

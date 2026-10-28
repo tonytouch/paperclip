@@ -329,6 +329,58 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("maps board principals for agent and skill configuration changes", async () => {
+    // Regression: `permissionForAction` returns null for the protected-change
+    // actions, so the board branch's `!permissionKey` fallback used to deny
+    // with "No board permission mapping exists for agent_config:update" before
+    // the grant lookup could run. A board principal holding agents:configure
+    // must be authorized for agent_config:update.
+    const company = await createCompany(db, "BoardProtectedChangeMapping");
+    const targetAgent = await createAgent(db, company.id);
+    const configureUserId = await createUser(db);
+    const noGrantUserId = await createUser(db);
+    await grantUserPermission(db, company.id, configureUserId, "agents:configure");
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: noGrantUserId,
+      status: "active",
+      membershipRole: "operator",
+    });
+
+    const authz = authorizationService(db);
+
+    await expect(authz.decide({
+      actor: { type: "board", userId: configureUserId, source: "session" },
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: company.id, agentId: targetAgent.id },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_direct_change",
+      grant: { permissionKey: "agents:configure" },
+    });
+
+    await expect(authz.decide({
+      actor: { type: "board", userId: configureUserId, source: "session" },
+      action: "agent_config:read",
+      resource: { type: "agent", companyId: company.id, agentId: targetAgent.id },
+    })).resolves.toMatchObject({
+      allowed: true,
+      grant: { permissionKey: "agents:configure" },
+    });
+
+    // A board principal without the grant still gets a grant-scoped denial, not
+    // the "no mapping exists" deny that the unreachable branch used to produce.
+    await expect(authz.decide({
+      actor: { type: "board", userId: noGrantUserId, source: "session" },
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: company.id, agentId: targetAgent.id },
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_no_grant",
+    });
+  });
+
   it("enforces direct or consented suggest grants for skill configuration changes", async () => {
     const company = await createCompany(db, "SkillChangeGrant");
     const directAgent = await createAgent(db, company.id);
@@ -467,6 +519,98 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision).toMatchObject({
       allowed: false,
       code: "RESPONSIBLE_USER_UNAUTHORIZED",
+    });
+  });
+
+  it("allows a manager to comment on and mutate issues assigned to its direct report", async () => {
+    const company = await createCompany(db, "ManagerIssueBoundary");
+    const managerAgent = await createAgent(db, company.id, { role: "ceo" });
+    const reportAgent = await createAgent(db, company.id, { role: "cto", reportsTo: managerAgent.id });
+    const peerAgent = await createAgent(db, company.id, { role: "cto" });
+    const reportIssue = await createIssue(db, company.id, {
+      title: "Direct report issue",
+      assigneeAgentId: reportAgent.id,
+    });
+    const peerIssue = await createIssue(db, company.id, {
+      title: "Peer issue",
+      assigneeAgentId: peerAgent.id,
+    });
+    const authz = authorizationService(db);
+    const managerActor = {
+      type: "agent",
+      agentId: managerAgent.id,
+      companyId: company.id,
+      source: "agent_key",
+    } as const;
+
+    for (const action of ["issue:comment", "issue:mutate"] as const) {
+      await expect(authz.decide({
+        actor: managerActor,
+        action,
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: reportIssue.id,
+          assigneeAgentId: reportAgent.id,
+        },
+      })).resolves.toMatchObject({
+        allowed: true,
+        reason: "allow_manager_chain",
+      });
+    }
+
+    // A peer with no reporting relationship stays outside the boundary.
+    for (const action of ["issue:comment", "issue:mutate"] as const) {
+      await expect(authz.decide({
+        actor: managerActor,
+        action,
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: peerIssue.id,
+          assigneeAgentId: peerAgent.id,
+        },
+      })).resolves.toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
+    }
+  });
+
+  it("keeps low-trust managers inside the low-trust boundary", async () => {
+    const company = await createCompany(db, "LowTrustManagerBoundary");
+    const allowedProject = await createProject(db, company.id, "LowTrustAllowed");
+    const managerAgent = await createAgent(db, company.id, {
+      role: "ceo",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: company.id,
+            projectIds: [allowedProject.id],
+          },
+        },
+      },
+    });
+    const reportAgent = await createAgent(db, company.id, { role: "cto", reportsTo: managerAgent.id });
+    const reportIssue = await createIssue(db, company.id, {
+      title: "Direct report issue outside the low-trust boundary",
+      assigneeAgentId: reportAgent.id,
+    });
+
+    await expect(authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: reportIssue.id,
+        assigneeAgentId: reportAgent.id,
+      },
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_low_trust_boundary",
     });
   });
 
