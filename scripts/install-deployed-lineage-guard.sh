@@ -12,7 +12,17 @@
 
 set -uo pipefail
 
-REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}"
+# Which tree do we install into? The tree THIS SCRIPT lives in, so that running
+# it from a fresh clone arms that clone rather than silently re-arming the
+# deployed tree. The env override still wins when explicitly set.
+INSTALLER_SELF="${BASH_SOURCE[0]}"
+INSTALLER_DIR="$(cd "$(dirname "$INSTALLER_SELF")" && pwd)"
+DEFAULT_REPO="$(cd "$INSTALLER_DIR/.." 2>/dev/null && pwd)"
+if [ -n "$DEFAULT_REPO" ] && [ -d "$DEFAULT_REPO/.git" ]; then
+  REPO="${PAPERCLIP_DEPLOYED_REPO:-$DEFAULT_REPO}"
+else
+  REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}"
+fi
 UNIT_DIR="${HOME}/.config/systemd/user"
 GUARD_DIR="${HOME}/.local/share/paperclip-guard"
 HOOK_NAMES="pre-commit pre-merge-commit post-merge post-checkout pre-push"
@@ -40,7 +50,19 @@ for hook in $HOOK_NAMES; do
 done
 
 # 2. Guard runner (a stable path outside the repo, so the timer keeps working
-#    even if the tree is being rebuilt).
+#    even if the tree is being rebuilt) + the systemd user timer.
+#
+#    The timer watches ONE tree - the deployed one. Running this installer
+#    from a different clone must arm that clone's hooks (done in step 1) but
+#    must NOT repoint the deployed timer at the clone. So the timer and the
+#    installed runner are only written for the deployed tree.
+DEPLOYED_REPO="/home/tony/tonysplace_best/workspace/paperclip"
+if [ "$REPO" != "$DEPLOYED_REPO" ]; then
+  echo "[$(ts)] install-deployed-lineage-guard: $REPO is not the deployed tree ($DEPLOYED_REPO)"
+  echo "[$(ts)] install-deployed-lineage-guard: armed THIS clone's hooks only; the deployed timer is untouched"
+  exit 0
+fi
+
 cp "$REPO/scripts/deployed-lineage-guard.sh" "$GUARD_DIR/deployed-lineage-guard.sh"
 chmod 0755 "$GUARD_DIR/deployed-lineage-guard.sh"
 
