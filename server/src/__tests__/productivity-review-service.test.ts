@@ -765,4 +765,70 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(afterSnooze.created).toBe(1);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(2);
   });
+
+  it("anchors the resolved-review snooze to the resolution time, not to later touches", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toBeTruthy();
+
+    // Resolved at `now`, exactly as the issue service records a `done` transition.
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: now, updatedAt: now })
+      .where(eq(issues.id, review!.id));
+
+    // A later touch of the closed review (a comment, a run lock, a field edit) bumps
+    // `updated_at`. That must not extend - or re-arm - the snooze window.
+    const touchedAt = new Date(now.getTime() + 6 * 60 * 60 * 1000);
+    await db.update(issues).set({ updatedAt: touchedAt }).where(eq(issues.id, review!.id));
+
+    // The 12h window is measured from the RESOLUTION, so it has expired by now even
+    // though the row was touched 6h after it was resolved.
+    const afterWindow = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS + 60 * 60 * 1000),
+      companyId: seeded.companyId,
+    });
+    expect(afterWindow.snoozed).toBe(0);
+    expect(afterWindow.created).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(2);
+  });
+
+  it("leaves no resolved-review bookkeeping behind when a done review is reopened", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toBeTruthy();
+
+    // Transient resolution followed by an immediate revert to open: the bulk-close
+    // accident. The revert must clear the resolved-review state entirely.
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: now, updatedAt: now })
+      .where(eq(issues.id, review!.id));
+    await db
+      .update(issues)
+      .set({ status: "todo", completedAt: null, updatedAt: new Date(now.getTime() + 60 * 1000) })
+      .where(eq(issues.id, review!.id));
+
+    const result = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + 30 * 60 * 1000),
+      companyId: seeded.companyId,
+    });
+    // Not snoozed: the reopened review is the live carrier again, so the trigger is
+    // visible instead of being swallowed by a stale resolved-review window.
+    expect(result.snoozed).toBe(0);
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
 });

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -290,7 +290,13 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
   ) {
     const cutoff = new Date(now.getTime() - thresholds.resolvedSnoozeMs);
     return db
-      .select({ id: issues.id, identifier: issues.identifier, status: issues.status, updatedAt: issues.updatedAt })
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        updatedAt: issues.updatedAt,
+        completedAt: issues.completedAt,
+      })
       .from(issues)
       .where(
         and(
@@ -298,7 +304,15 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
           eq(issues.status, "done"),
-          gt(issues.updatedAt, cutoff),
+          // The snooze window is anchored to WHEN THE REVIEW WAS RESOLVED, never to the
+          // last time the row was touched. `updated_at` is bumped by unrelated activity
+          // on a closed review (a comment, a run lock, a field edit), which silently
+          // extends - or re-arms - the snooze and swallows a legitimate trigger for
+          // longer than the configured window. `completed_at` is set when the review
+          // transitions to `done` and cleared when it is reopened, so a transient
+          // done -> open round trip leaves no resolved-review state behind at all.
+          // Legacy rows resolved before `completed_at` existed fall back to `updated_at`.
+          sql`coalesce(${issues.completedAt}, ${issues.updatedAt}) > ${cutoff.toISOString()}::timestamptz`,
         ),
       )
       .orderBy(desc(issues.updatedAt))
