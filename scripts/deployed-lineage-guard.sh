@@ -30,6 +30,11 @@ REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}
 FIX_COMMIT="fa3c22dd14a2502ed055ef6e7c309478ff7d5346"
 DURABLE_REMOTE="${PAPERCLIP_DURABLE_REMOTE:-fork}"
 DURABLE_BRANCH="${PAPERCLIP_DURABLE_BRANCH:-ton/deployed-long-active-fix}"
+# The invariant is not the remote's NAME (a fresh clone may call it anything)
+# but WHICH REPOSITORY it points at: our fork carries the fix, upstream deleted
+# the feature. So we assert the URL, and we assert upstream is not it.
+DURABLE_URL_PATTERN="${PAPERCLIP_DURABLE_URL_PATTERN:-tonytouch/paperclip}"
+FORBIDDEN_URL_PATTERN="${PAPERCLIP_FORBIDDEN_URL_PATTERN:-paperclipai/paperclip}"
 SERVICE="server/src/services/productivity-review.ts"
 TESTFILE="server/src/__tests__/productivity-review-service.test.ts"
 MARKER="findLiveContinuationPath"
@@ -52,11 +57,30 @@ head_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
 echo "[$(ts)] deployed-lineage-guard: repo=$REPO branch=$branch upstream=$upstream head=${head_sha:0:10}"
 
-# 1. The deployed branch must track the durable fork branch. If it tracks
-#    anything on upstream, an ordinary pull can delete the service.
+# 1. The deployed branch must track the durable fork branch, and the remote it
+#    tracks must be OUR FORK - not upstream. If it tracks upstream, an ordinary
+#    pull can delete the service. We check the remote URL, not just its name,
+#    so a clone that calls the fork 'origin' is judged on the same merits.
 case "$upstream" in
   "$DURABLE_REMOTE/$DURABLE_BRANCH") ;;
-  *) fail "deployed branch '$branch' tracks '$upstream', expected '$DURABLE_REMOTE/$DURABLE_BRANCH'" ;;
+  */*)
+    up_remote="${upstream%%/*}"
+    up_branch="${upstream#*/}"
+    if [ "$up_branch" != "$DURABLE_BRANCH" ]; then
+      fail "deployed branch '$branch' tracks '$upstream', expected branch '$DURABLE_BRANCH'"
+    fi
+    up_url="$(git remote get-url "$up_remote" 2>/dev/null || echo unknown)"
+    case "$up_url" in
+      *"$FORBIDDEN_URL_PATTERN"*)
+        fail "deployed branch '$branch' tracks '$upstream' -> $up_url (upstream, which DELETED the productivity-review feature)" ;;
+      *"$DURABLE_URL_PATTERN"*) ;;
+      *) fail "deployed branch '$branch' tracks '$up_remote' -> $up_url, which is not our fork ($DURABLE_URL_PATTERN)" ;;
+    esac
+    DURABLE_REMOTE="$up_remote"
+    ;;
+  *)
+    fail "deployed branch '$branch' tracks '$upstream', expected '$DURABLE_REMOTE/$DURABLE_BRANCH'"
+    ;;
 esac
 
 # 2. The fix commit must be in the deployed history.
