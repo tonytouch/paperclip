@@ -26,7 +26,23 @@
 
 set -uo pipefail
 
-REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}"
+# Which tree does this guard inspect? It MUST be the tree the guard itself
+# lives in, otherwise running it from a fresh clone silently validates the
+# deployed tree instead and reports OK on a broken clone. The env override is
+# still honoured (the systemd unit and the redeploy script use it to point at
+# the deployed tree explicitly), but the default is derived from this script's
+# own location.
+GUARD_SELF="${BASH_SOURCE[0]}"
+GUARD_DIR="$(cd "$(dirname "$GUARD_SELF")" && pwd)"
+DEFAULT_REPO="$(cd "$GUARD_DIR/.." 2>/dev/null && pwd)"
+# The installed copy lives outside the repo (~/.local/share/paperclip-guard), so
+# the derived parent is not a git tree; fall back to the known deployed tree in
+# that case. The systemd unit also sets PAPERCLIP_DEPLOYED_REPO explicitly.
+if [ -n "$DEFAULT_REPO" ] && [ -d "$DEFAULT_REPO/.git" ]; then
+  REPO="${PAPERCLIP_DEPLOYED_REPO:-$DEFAULT_REPO}"
+else
+  REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}"
+fi
 FIX_COMMIT="fa3c22dd14a2502ed055ef6e7c309478ff7d5346"
 DURABLE_REMOTE="${PAPERCLIP_DURABLE_REMOTE:-fork}"
 DURABLE_BRANCH="${PAPERCLIP_DURABLE_BRANCH:-ton/deployed-long-active-fix}"

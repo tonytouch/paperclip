@@ -44,7 +44,7 @@ done
 cp "$REPO/scripts/deployed-lineage-guard.sh" "$GUARD_DIR/deployed-lineage-guard.sh"
 chmod 0755 "$GUARD_DIR/deployed-lineage-guard.sh"
 
-cat > "$UNIT_DIR/paperclip-guard-deployed-lineage.service" <<'UNIT'
+cat > "$UNIT_DIR/paperclip-guard-deployed-lineage.service" <<UNIT
 [Unit]
 Description=TON-814 deployed paperclip tree lineage guard (long_active_duration fix must survive a redeploy)
 After=network-online.target
@@ -52,6 +52,9 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/home/tony/.local/share/paperclip-guard/deployed-lineage-guard.sh
+# The installed guard lives OUTSIDE the repo, so it cannot derive the tree it
+# guards from its own location. Point it at the deployed tree explicitly.
+Environment=PAPERCLIP_DEPLOYED_REPO=$REPO
 Nice=10
 UNIT
 
