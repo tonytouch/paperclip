@@ -91,6 +91,17 @@ function isPathInside(candidatePath: string, rootPath: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
+function resolveMainPaperclipHomes(): string[] {
+  const homes = new Set<string>([path.resolve(os.homedir(), ".paperclip")]);
+  try {
+    const accountHome = os.userInfo().homedir;
+    if (accountHome) homes.add(path.resolve(accountHome, ".paperclip"));
+  } catch {
+    // No passwd entry (some containers): $HOME is all we can check.
+  }
+  return [...homes];
+}
+
 type WorktreeRuntimeContext = {
   configPath: string;
   envPath: string;
@@ -142,16 +153,21 @@ function resolveWorktreeRuntimeContext(
   // repairing would point production at the worktree database and ports (the
   // 2026-11-04 incident). Fail startup instead of falling back to that config,
   // which would put this process on the production database.
-  const mainHome = path.resolve(os.homedir(), ".paperclip");
-  if (
-    isPathInside(configPath, path.resolve(mainHome, "instances")) &&
-    path.resolve(homeDir) !== mainHome
-  ) {
-    throw new Error(
-      `Refusing to start a worktree instance (PAPERCLIP_IN_WORKTREE=true, home ${homeDir}) ` +
-        `against the main Paperclip instance config ${configPath}. ` +
-        "Set PAPERCLIP_CONFIG to the worktree config instead.",
-    );
+  // Check both $HOME and the account's real home: an agent run may override
+  // HOME to a scratch dir while still inheriting the absolute production
+  // PAPERCLIP_CONFIG, which would otherwise slip past this guard.
+  const resolvedHomeDir = path.resolve(homeDir);
+  for (const mainHome of resolveMainPaperclipHomes()) {
+    if (
+      isPathInside(configPath, path.resolve(mainHome, "instances")) &&
+      resolvedHomeDir !== mainHome
+    ) {
+      throw new Error(
+        `Refusing to start a worktree instance (PAPERCLIP_IN_WORKTREE=true, home ${homeDir}) ` +
+          `against the main Paperclip instance config ${configPath}. ` +
+          "Set PAPERCLIP_CONFIG to the worktree config instead.",
+      );
+    }
   }
 
   return {

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyRuntimePortSelectionToConfig,
   maybePersistWorktreeRuntimePorts,
@@ -725,5 +725,39 @@ describe("worktree mode never rewrites the main instance", () => {
     );
     expect(await fs.readFile(configPath, "utf8")).toBe(config);
     expect(await fs.readFile(envPath, "utf8")).toBe(env);
+  });
+
+  it("still refuses when HOME is overridden but the config is under the account's real home", async () => {
+    const accountHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-account-home-"));
+    const scratchHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-scratch-home-"));
+    const mainInstance = path.join(accountHome, ".paperclip", "instances", "default");
+    const configPath = path.join(mainInstance, "config.json");
+    const envPath = path.join(mainInstance, ".env");
+    const config = JSON.stringify(buildLegacyConfig(mainInstance), null, 2) + "\n";
+    const env = "PAPERCLIP_AGENT_JWT_SECRET=main-secret\n";
+    await fs.mkdir(mainInstance, { recursive: true });
+    await fs.writeFile(configPath, config, "utf8");
+    await fs.writeFile(envPath, env, "utf8");
+
+    const realUserInfo = os.userInfo();
+    const spy = vi.spyOn(os, "userInfo").mockReturnValue({ ...realUserInfo, homedir: accountHome } as never);
+    try {
+      process.env.HOME = scratchHome;
+      process.env.PAPERCLIP_IN_WORKTREE = "true";
+      process.env.PAPERCLIP_WORKTREE_NAME = "PAP-884-ai-commits-component";
+      process.env.PAPERCLIP_HOME = path.join(scratchHome, ".paperclip-worktrees");
+      process.env.PAPERCLIP_CONFIG = configPath;
+      delete process.env.PAPERCLIP_INSTANCE_ID;
+      delete process.env.PAPERCLIP_CONTEXT;
+
+      expect(() => maybeRepairLegacyWorktreeConfigAndEnvFiles()).toThrow(/main Paperclip instance/);
+      expect(() => maybePersistWorktreeRuntimePorts({ serverPort: 3101, databasePort: 54330 })).toThrow(
+        /main Paperclip instance/,
+      );
+      expect(await fs.readFile(configPath, "utf8")).toBe(config);
+      expect(await fs.readFile(envPath, "utf8")).toBe(env);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
