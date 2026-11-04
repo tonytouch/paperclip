@@ -84,6 +84,33 @@ const mockExternalObjectService = vi.hoisted(() => ({
   syncIssueSafely: vi.fn(async () => undefined),
 }));
 
+const mockTaskWatchdogService = vi.hoisted(() => ({
+  reconcileForIssueAndAncestors: vi.fn(async () => ({
+    checked: 0,
+    triggered: 0,
+    pendingFirstRun: 0,
+    skipped: 0,
+    watchdogIssueIds: [],
+  })),
+  reconcileTaskWatchdogs: vi.fn(async () => ({
+    checked: 0,
+    triggered: 0,
+    live: 0,
+    pendingFirstRun: 0,
+    alreadyReviewed: 0,
+    skipped: 0,
+    watchdogIssueIds: [],
+  })),
+  getActiveForIssue: vi.fn(async () => null),
+  upsertForIssue: vi.fn(async () => null),
+  disableForIssue: vi.fn(async () => null),
+  listActiveSummariesForIssues: vi.fn(async () => new Map()),
+  revalidateMutationScope: vi.fn(async () => ({
+    allowed: true,
+    classification: { state: "live", reason: "Task watchdog service unavailable in this route context." },
+  })),
+}));
+
 vi.mock("@paperclipai/shared/telemetry", () => ({
   trackAgentTaskCompleted: vi.fn(),
   trackErrorHandlerCrash: vi.fn(),
@@ -162,6 +189,7 @@ vi.mock("../services/index.js", () => ({
   logActivity: mockLogActivity,
   projectService: () => ({}),
   routineService: () => mockRoutineService,
+  taskWatchdogService: () => mockTaskWatchdogService,
   workProductService: () => ({}),
 }));
 
@@ -266,6 +294,8 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueTreeControlService.getActivePauseHoldGate.mockReset();
     mockExternalObjectService.syncCommentSafely.mockReset();
     mockExternalObjectService.syncIssueSafely.mockReset();
+    mockTaskWatchdogService.reconcileForIssueAndAncestors.mockReset();
+    mockTaskWatchdogService.reconcileTaskWatchdogs.mockReset();
     mockTxInsertValues.mockReset();
     mockTxInsert.mockReset();
     mockDbSelect.mockReset();
@@ -291,6 +321,13 @@ describe.sequential("issue comment reopen routes", () => {
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
     mockExternalObjectService.syncIssueSafely.mockResolvedValue(undefined);
+    mockTaskWatchdogService.reconcileForIssueAndAncestors.mockResolvedValue({
+      checked: 0,
+      triggered: 0,
+      pendingFirstRun: 0,
+      skipped: 0,
+      watchdogIssueIds: [],
+    });
     mockLogActivity.mockResolvedValue(undefined);
     mockFeedbackService.listIssueVotesForUser.mockResolvedValue([]);
     mockFeedbackService.saveIssueVote.mockResolvedValue({
@@ -2897,4 +2934,24 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     ));
   });
+  it("returns the created comment even when the post-write watchdog reconcile stalls (TON-1115)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    // The task-watchdog reconcile is the slowest step that runs after the
+    // comment row is committed. Before TON-1115 the response waited on it, so a
+    // stalled reconcile made a successful write look like a timeout and invited
+    // duplicate retries (duplicate comments, duplicate wakes).
+    mockTaskWatchdogService.reconcileForIssueAndAncestors.mockImplementation(() => new Promise(() => {}));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "hello" });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({ id: "comment-1", body: "hello" });
+    // The reconcile still runs; it just no longer holds the response hostage.
+    await vi.waitFor(() => {
+      expect(mockTaskWatchdogService.reconcileForIssueAndAncestors).toHaveBeenCalled();
+    });
+  });
+
 });

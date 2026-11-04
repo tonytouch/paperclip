@@ -9855,75 +9855,87 @@ export function issueRoutes(
       });
     }
 
-    await issueReferencesSvc.syncComment(comment.id);
-    await externalObjectsSvc.syncCommentSafely(comment.id);
-    const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
-    const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
-      commentReferenceSummaryBefore,
-      commentReferenceSummaryAfter,
-    );
+    // TON-1115: the comment row is already committed at this point, but this
+    // bookkeeping used to run inline, so a slow reference sync / activity log /
+    // watchdog reconcile could push the response past the caller's timeout even
+    // though the write had succeeded. Detach it: the response carries the created
+    // comment as soon as the write is committed.
+    void (async () => {
+      try {
+        await issueReferencesSvc.syncComment(comment.id);
+        await externalObjectsSvc.syncCommentSafely(comment.id);
+        const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
+        const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
+          commentReferenceSummaryBefore,
+          commentReferenceSummaryAfter,
+        );
 
-    if (actor.runId) {
-      await heartbeat.reportRunActivity(actor.runId).catch((err) =>
-        logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue comment"));
-    }
+        if (actor.runId) {
+          await heartbeat.reportRunActivity(actor.runId).catch((err) =>
+            logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue comment"));
+        }
 
-    await logActivity(db, {
-      companyId: currentIssue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.comment_added",
-      entityType: "issue",
-      entityId: currentIssue.id,
-      details: {
-        commentId: comment.id,
-        bodySnippet: comment.body.slice(0, 120),
-        identifier: currentIssue.identifier,
-        issueTitle: currentIssue.title,
-        ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-        ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
-        ...(scheduledRetrySupersededByComment
-          ? {
-              scheduledRetrySupersededByComment: true,
-              scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
-              ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
-            }
-          : {}),
-        ...(interruptedRunId ? { interruptedRunId } : {}),
-        ...summarizeIssueReferenceActivityDetails({
-          addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
-          removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
-          currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
-        }),
-      },
-    });
+        await logActivity(db, {
+          companyId: currentIssue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.comment_added",
+          entityType: "issue",
+          entityId: currentIssue.id,
+          details: {
+            commentId: comment.id,
+            bodySnippet: comment.body.slice(0, 120),
+            identifier: currentIssue.identifier,
+            issueTitle: currentIssue.title,
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+            ...(scheduledRetrySupersededByComment
+              ? {
+                  scheduledRetrySupersededByComment: true,
+                  scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
+                  ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
+                }
+              : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+            ...summarizeIssueReferenceActivityDetails({
+              addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+              removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+              currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+            }),
+          },
+        });
 
-    const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
-      currentIssue,
-      comment,
-      {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      },
-    );
-    await logExpiredRequestConfirmations({
-      issue: currentIssue,
-      interactions: expiredInteractions,
-      actor,
-      source: "issue.comment",
-    });
+        const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
+          currentIssue,
+          comment,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        await logExpiredRequestConfirmations({
+          issue: currentIssue,
+          interactions: expiredInteractions,
+          actor,
+          source: "issue.comment",
+        });
 
-    await revalidateActiveSourceRecoveryAfterCommittedWrite({
-      issue: currentIssue,
-      trigger: "comment",
-      actor,
-      statusChanged: reopened || scheduledRetrySupersededByComment,
-      resumeRequested: resumeRequested === true,
-      reopened,
-      blockedToTodoRecovery: reopened && reopenFromStatus === "blocked" && currentIssue.status === "todo",
-    });
+        await revalidateActiveSourceRecoveryAfterCommittedWrite({
+          issue: currentIssue,
+          trigger: "comment",
+          actor,
+          statusChanged: reopened || scheduledRetrySupersededByComment,
+          resumeRequested: resumeRequested === true,
+          reopened,
+          blockedToTodoRecovery: reopened && reopenFromStatus === "blocked" && currentIssue.status === "todo",
+        });
+        await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
+      } catch (err) {
+        logger.warn({ err, issueId: currentIssue.id }, "failed to finalize issue comment side effects");
+      }
+    })();
 
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {
@@ -10158,7 +10170,6 @@ export function issueRoutes(
       }
     })();
 
-    await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
     res.status(201).json(comment);
   });
 
