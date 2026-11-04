@@ -251,6 +251,11 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   // the same oversized prompt, but it is still recoverable, so the
   // infra-continuation ladder must treat it as transient (TON-868).
   "acpx_transient_upsert",
+  // TON-1001: the attempt's own transcript crossed the context budget. The
+  // attempt was stopped on purpose, so the retry is recoverable - it starts
+  // on a fresh session and resumes from the attempt's durable partial
+  // progress.
+  "acpx_transient_transcript_overflow",
   "provider_quota",
   "timeout",
 ]);

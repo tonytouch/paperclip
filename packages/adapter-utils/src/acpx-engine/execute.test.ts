@@ -1166,3 +1166,170 @@ describe("shared ACP engine execution timeouts", () => {
     expect(cancelReasons).toContain(expectedMessage);
   }, 15_000);
 });
+
+describe("shared ACPX engine transcript budget", () => {
+  /**
+   * TON-1001: a single long attempt grows its OWN ACP transcript until the
+   * provider refuses the next request with "context window exceeds limit
+   * (2013)". The attempt must be stopped BEFORE that refusal, so the run
+   * ends in a retryable stop with its partial progress intact.
+   */
+  async function runTranscriptBudgetTurn(
+    events: Array<Record<string, unknown>>,
+    config: Record<string, unknown>,
+  ) {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const cancelReasons: string[] = [];
+    let cancelled = false;
+    let settle: ((value: { status: string; stopReason: string }) => void) | null = null;
+
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            for (const event of events) {
+              if (cancelled) return;
+              yield event;
+            }
+            // The event stream ran to completion: the turn finished normally.
+            settle?.({ status: "completed", stopReason: "end_turn" });
+          })(),
+          // The real runtime settles the turn only when the attempt ends, so
+          // the result must NOT resolve before the cancel arrives.
+          result: new Promise<{ status: string; stopReason: string }>((resolve) => {
+            settle = resolve;
+          }),
+          cancel: async ({ reason }: { reason: string }) => {
+            cancelReasons.push(reason);
+            cancelled = true;
+            settle?.({ status: "cancelled", stopReason: "cancelled" });
+          },
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-transcript-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd,
+        ...config,
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    return { result, cancelReasons };
+  }
+
+  it("stops an attempt whose own transcript crosses the budget, before the provider refuses", async () => {
+    const { result, cancelReasons } = await runTranscriptBudgetTurn(
+      [
+        { type: "text_delta", text: "working on it" },
+        {
+          type: "status",
+          text: "usage updated: 190000/200000",
+          tag: "usage_update",
+          used: 190_000,
+          size: 200_000,
+        },
+        { type: "text_delta", text: "never reached" },
+      ],
+      { contextUsageStopRatio: 0.85 },
+    );
+
+    // The stop is PREEMPTIVE: the run never sees a 2013.
+    expect(result.errorCode).toBe("acpx_transient_transcript_overflow");
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.errorMessage).toContain("stopped before the context window overflowed");
+    expect(result.errorMessage).not.toContain("2013");
+    // The attempt was cancelled here rather than dying mid-flight.
+    expect(cancelReasons).toHaveLength(1);
+    expect(cancelReasons[0]).toContain("stopped before the context window overflowed");
+    // The partial progress is durable so the next attempt can resume from it.
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.partialProgress).toBe("working on it");
+    expect(resultJson.transcriptStop).toMatchObject({ cause: "transcript" });
+    // The session that carries the overflowing transcript is dropped.
+    expect(result.clearSession).toBe(true);
+  });
+
+  it("stops an attempt that accumulates past the transcript character budget", async () => {
+    const { result } = await runTranscriptBudgetTurn(
+      [
+        { type: "text_delta", text: "x".repeat(500) },
+        { type: "tool_call", title: "read_file", rawOutput: { content: "y".repeat(600) } },
+      ],
+      { transcriptBudgetChars: 100, contextUsageStopRatio: 0.99 },
+    );
+
+    expect(result.errorCode).toBe("acpx_transient_transcript_overflow");
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.transcriptStop).toMatchObject({ reason: "transcript_chars" });
+  });
+
+  it("does not let a usage reset mask a full context window", async () => {
+    // The ACP usage stream interleaves `0/200000` resets (a task-notification
+    // turn reports zero even while the conversation is nearly full). The
+    // fatal 43-minute attempt ended on exactly such a reset, six seconds
+    // before the 2013. If the tracker kept the LAST sample rather than the
+    // highest one, the window would read as empty and the attempt would run
+    // straight into the refusal.
+    const { result, cancelReasons } = await runTranscriptBudgetTurn(
+      [
+        {
+          type: "status",
+          text: "usage updated: 190000/200000",
+          tag: "usage_update",
+          used: 190_000,
+          size: 200_000,
+        },
+        {
+          type: "status",
+          text: "usage updated: 0/200000",
+          tag: "usage_update",
+          used: 0,
+          size: 200_000,
+        },
+        { type: "text_delta", text: "never reached" },
+      ],
+      { contextUsageStopRatio: 0.85 },
+    );
+
+    expect(result.errorCode).toBe("acpx_transient_transcript_overflow");
+    expect(cancelReasons).toHaveLength(1);
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.transcriptStop).toMatchObject({ reason: "context_usage" });
+  });
+
+  it("lets an attempt under the budget finish normally", async () => {
+    const { result, cancelReasons } = await runTranscriptBudgetTurn(
+      [
+        { type: "text_delta", text: "small" },
+        { type: "status", text: "usage updated: 1000/200000", tag: "usage_update", used: 1_000, size: 200_000 },
+      ],
+      {},
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeNull();
+    expect(cancelReasons).toHaveLength(0);
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.partialProgress).toBeUndefined();
+  });
+});

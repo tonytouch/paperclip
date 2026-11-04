@@ -304,6 +304,11 @@ const PROVIDER_QUOTA_ERROR_CODES = new Set(["provider_quota"]);
 const TRANSIENT_UPSTREAM_ERROR_CODES = new Set([
   "acpx_transient_upstream",
   "acpx_transient_upsert",
+  // TON-1001: the attempt's own transcript crossed the context budget. It is
+  // an upstream refusal reached by a different route, so it belongs to the
+  // same family - but it keeps its own code so a reviewer can tell it apart
+  // from an oversized-prompt replay.
+  "acpx_transient_transcript_overflow",
   "codex_transient_upstream",
   "claude_transient_upstream",
 ]);

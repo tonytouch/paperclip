@@ -63,8 +63,30 @@ import {
 } from "./constants.js";
 import { classifyContextWindowOverflowFailure } from "./context-overflow.js";
 import { classifyTransientUpstreamFailure } from "./transient-upstream.js";
+import {
+  DEFAULT_CONTEXT_USAGE_STOP_RATIO,
+  DEFAULT_TRANSCRIPT_BUDGET_CHARS,
+  TRANSCRIPT_OVERFLOW_ERROR_CODE,
+  TRANSCRIPT_OVERFLOW_ERROR_FAMILY,
+  buildTranscriptStop,
+  classifyContextOverflowCause,
+  evaluateTranscriptBudget,
+  measureTranscriptEventChars,
+  mergeContextUsageSample,
+  readContextUsageSample,
+  type ContextUsageSample,
+  type TranscriptStop,
+} from "./transcript-budget.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * How much of a stopped attempt's partial progress is kept as durable state.
+ *
+ * The partial progress is what the next attempt resumes from, so it must be
+ * long enough to be useful and short enough not to re-inflate the very
+ * context window that overflowed.
+ */
+const TRANSCRIPT_PARTIAL_PROGRESS_MAX_CHARS = 4_000;
 const WRAPPER_CLEANUP_RETENTION_MS = 15 * 60 * 1000;
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
 
@@ -1868,9 +1890,56 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       cancelActiveTurn = async (reason: string) => {
         await turn.cancel({ reason });
       };
+      // TON-1001: bound the ATTEMPT, not just the prompt. A single long
+      // attempt grows its own ACP transcript until the provider refuses the
+      // next request with "context window exceeds limit (2013)" - the same
+      // refusal an oversized prompt produces. Track the transcript as the
+      // attempt works and stop BEFORE the provider refuses, so the run ends
+      // in a retryable stop with its partial progress intact.
+      const transcriptBudgetChars = asNumber(
+        ctx.config.transcriptBudgetChars,
+        DEFAULT_TRANSCRIPT_BUDGET_CHARS,
+      );
+      const contextUsageStopRatio = asNumber(
+        ctx.config.contextUsageStopRatio,
+        DEFAULT_CONTEXT_USAGE_STOP_RATIO,
+      );
+      let transcriptChars = 0;
+      let usageSample: ContextUsageSample | null = null;
+      let transcriptStop: TranscriptStop | null = null;
       for await (const event of turn.events) {
         if (event.type === "text_delta") textParts.push(event.text);
+        transcriptChars += measureTranscriptEventChars(event);
+        if (event.type === "status") {
+          const sample = readContextUsageSample({
+            tag: event.tag ?? null,
+            used: event.used ?? null,
+            size: event.size ?? null,
+          });
+          if (sample) usageSample = mergeContextUsageSample(usageSample, sample);
+        }
         await emitRuntimeEvent(ctx, event);
+        const decision = evaluateTranscriptBudget({
+          transcriptChars,
+          transcriptBudgetChars,
+          usage: usageSample,
+          usageRatio: contextUsageStopRatio,
+        });
+        if (decision.stop && decision.reason) {
+          transcriptStop = buildTranscriptStop({
+            transcriptChars,
+            reason: decision.reason,
+            transcriptBudgetChars,
+            usage: usageSample,
+            usageRatio: contextUsageStopRatio,
+          });
+          break;
+        }
+      }
+      if (transcriptStop) {
+        // Cancel the turn so the attempt ends HERE, with a fresh session for
+        // the retry, instead of dying mid-flight with a 2013.
+        await cancelActiveTurn?.(transcriptStop.message).catch(() => {});
       }
       const terminal = await turn.result;
       if (timeout) clearTimeout(timeout);
@@ -1944,7 +2013,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
 
       const errorMessage = timedOut
         ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
-        : resultErrorMessage(terminal);
+        : transcriptStop
+          ? transcriptStop.message
+          : resultErrorMessage(terminal);
       const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
       await emitAcpxLog(ctx, {
         type: terminal.status === "completed" ? "acpx.result" : "acpx.error",
@@ -1958,12 +2029,25 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // session. Reporting it as a deterministic `acpx_turn_failed` made the
       // heartbeat treat it as non-retryable, so a single dropped connection
       // killed the whole run with no recovery (TON-639).
-      const terminalContextOverflowFailure =
+      const terminalContextOverflowDetected =
         terminalContextOverflow ??
         (terminal.status === "failed"
           ? (classifyContextWindowOverflowFailure(terminalStopReason) ??
             classifyContextWindowOverflowFailure(errorMessage))
           : null);
+      // A context-window refusal has TWO causes and they need different
+      // recoveries: an oversized PROMPT is the replay problem TON-868 fixed,
+      // while a transcript that grew during the attempt is TON-1001's. Tell
+      // them apart by what actually filled the window, so the run history can
+      // route them differently.
+      const terminalContextOverflowFailure = terminalContextOverflowDetected
+        ? classifyContextOverflowCause({
+            promptChars: promptMetrics.promptChars ?? 0,
+            transcriptChars,
+            usage: usageSample,
+            usageRatio: contextUsageStopRatio,
+          })
+        : null;
       const terminalTransientUpstream =
         terminalContextOverflowFailure
           ? null
@@ -1971,17 +2055,37 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? (classifyTransientUpstreamFailure(terminalStopReason) ??
               classifyTransientUpstreamFailure(errorMessage))
             : null;
+      // The preemptive transcript stop is its own outcome: the attempt was
+      // stopped on purpose, so the run must report the distinct code rather
+      // than a generic turn failure.
+      const transcriptStopFailure = transcriptStop
+        ? {
+            errorCode: TRANSCRIPT_OVERFLOW_ERROR_CODE,
+            errorFamily: TRANSCRIPT_OVERFLOW_ERROR_FAMILY,
+            errorMeta: {
+              category: "context_overflow",
+              cause: "transcript",
+              ...transcriptStop.detail,
+            },
+          }
+        : null;
+      const partialProgress = textParts.join("").trim();
       return {
         exitCode: terminal.status === "completed" ? 0 : 1,
         signal: timedOut ? "SIGTERM" : null,
         timedOut,
         errorMessage,
         errorCode:
+          transcriptStopFailure?.errorCode ??
           terminalContextOverflowFailure?.errorCode ??
           terminalTransientUpstream?.errorCode ??
           (terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null),
         errorFamily:
-          terminalContextOverflowFailure?.errorFamily ?? terminalTransientUpstream?.errorFamily ?? null,
+          transcriptStopFailure?.errorFamily ??
+          terminalContextOverflowFailure?.errorFamily ??
+          terminalTransientUpstream?.errorFamily ??
+          null,
+        errorMeta: transcriptStopFailure?.errorMeta,
         sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
         sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
         sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -1997,12 +2101,33 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           requestedModel: prepared.requestedModel || null,
           requestedThinkingEffort: prepared.requestedThinkingEffort || null,
           fastMode: prepared.fastMode,
+          ...(transcriptStop ? { transcriptStop: transcriptStop.detail } : {}),
+          // The partial progress the stopped attempt produced. It is durable
+          // (it rides on the run row) so the NEXT attempt can resume from it
+          // instead of from the transcript that crossed the window.
+          ...(transcriptStop && partialProgress
+            ? { partialProgress: partialProgress.slice(-TRANSCRIPT_PARTIAL_PROGRESS_MAX_CHARS) }
+            : {}),
         },
-        summary: textParts.join("").trim() || terminalStopReason || terminal.status,
+        // A stopped attempt's text is the WHOLE transcript's assistant output,
+        // so it is bounded like the partial progress. An unbounded summary
+        // would inflate the run row and be replayed into the next attempt's
+        // prompt - the very inflation this bound exists to prevent.
+        summary: transcriptStop
+          ? partialProgress.slice(-TRANSCRIPT_PARTIAL_PROGRESS_MAX_CHARS) ||
+            terminalStopReason ||
+            terminal.status
+          : partialProgress || terminalStopReason || terminal.status,
         // The upstream stream was cut mid-response, so the session's last
         // assistant message is truncated. Resuming it would replay the same
         // broken turn, so drop the session and let the retry start clean.
-        clearSession: clearSession || Boolean(terminalTransientUpstream) || Boolean(terminalContextOverflowFailure),
+        // A preemptive transcript stop drops it too: the persisted session
+        // carries the very transcript that crossed the budget.
+        clearSession:
+          clearSession ||
+          Boolean(terminalTransientUpstream) ||
+          Boolean(terminalContextOverflowFailure) ||
+          Boolean(transcriptStop),
       };
     } catch (err) {
       if (timeout) clearTimeout(timeout);

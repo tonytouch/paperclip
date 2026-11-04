@@ -5,6 +5,7 @@ import {
   CONTEXT_RESEED_MAX_ANCESTORS,
   CONTEXT_RESEED_MAX_DESCRIPTION_CHARS,
   CONTEXT_RESEED_NOTE,
+  CONTEXT_RESEED_REASON_TRANSCRIPT_OVERFLOW,
   boundAncestors,
   boundContinuationSummary,
   boundIssueDescription,
@@ -33,8 +34,35 @@ describe("context re-seed directive", () => {
       reason: "context_overflow",
       sourceRunId: "run-1",
       attempt: 2,
+      partialProgress: null,
     });
     expect(snapshot[CONTEXT_RESEED_KEY]).toBeTruthy();
+  });
+
+  it("carries the stopped attempt's partial progress (TON-1001)", () => {
+    const snapshot = buildContextReseedSnapshot({
+      sourceRunId: "run-1",
+      attempt: 3,
+      reason: CONTEXT_RESEED_REASON_TRANSCRIPT_OVERFLOW,
+      partialProgress: "the work the stopped attempt already did",
+    });
+    const directive = readContextReseedDirective(snapshot);
+    expect(directive).toEqual({
+      reason: CONTEXT_RESEED_REASON_TRANSCRIPT_OVERFLOW,
+      sourceRunId: "run-1",
+      attempt: 3,
+      partialProgress: "the work the stopped attempt already did",
+    });
+  });
+
+  it("drops an empty partial progress rather than carrying a blank block", () => {
+    const snapshot = buildContextReseedSnapshot({
+      sourceRunId: "run-1",
+      attempt: 3,
+      reason: CONTEXT_RESEED_REASON_TRANSCRIPT_OVERFLOW,
+      partialProgress: "   ",
+    });
+    expect(readContextReseedDirective(snapshot)?.partialProgress).toBeNull();
   });
 
   it("reads no directive from a normal run's context snapshot", () => {

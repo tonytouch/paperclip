@@ -12,6 +12,7 @@
 
 import { parseObject } from "../adapters/utils.js";
 import { CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/context-overflow";
+import { TRANSCRIPT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/transcript-budget";
 
 export type HeartbeatRunErrorFamily = "provider_quota" | "transient_upstream" | string;
 
@@ -116,6 +117,14 @@ function classifyErrorFamily(run: FlattenedErrorFamilyRun): HeartbeatRunErrorFam
   // prompt with a bounded context. The family keeps the bounded retry ladder
   // engaged; the CODE is what selects the re-seed path (TON-868).
   if (run.errorCode === CONTEXT_OVERFLOW_ERROR_CODE) {
+    return "transient_upstream";
+  }
+  // A transcript overflow (TON-1001) is the SAME upstream refusal reached by
+  // a different route: the attempt's own accumulated transcript grew past
+  // the window, not the prompt. It keeps the family so the bounded retry
+  // ladder engages, and carries its own code so the run history can tell it
+  // apart from an oversized-prompt replay.
+  if (run.errorCode === TRANSCRIPT_OVERFLOW_ERROR_CODE) {
     return "transient_upstream";
   }
   // Generic adapter failures that are actually an upstream rate-limit refusal

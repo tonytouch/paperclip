@@ -222,6 +222,7 @@ import {
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import { CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/context-overflow";
+import { TRANSCRIPT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/transcript-budget";
 import {
   boundAncestors,
   boundContinuationSummary,
@@ -229,6 +230,8 @@ import {
   buildContextReseedSnapshot,
   readContextReseedDirective,
   CONTEXT_RESEED_NOTE,
+  CONTEXT_RESEED_PARTIAL_PROGRESS_PREFIX,
+  CONTEXT_RESEED_REASON_TRANSCRIPT_OVERFLOW,
 } from "./context-reseed.js";
 import {
   readPaperclipSkillSyncPreference,
@@ -436,6 +439,41 @@ function isContextWindowOverflowRun(
   if (run.errorCode === CONTEXT_OVERFLOW_ERROR_CODE) return true;
   const resultJson = parseObject(run.resultJson);
   return resultJson.errorCode === CONTEXT_OVERFLOW_ERROR_CODE;
+}
+
+/**
+ * True when the run was STOPPED because its own transcript crossed the
+ * context budget (TON-1001).
+ *
+ * Such a run is not replayable either - the ACP session carries the very
+ * transcript that grew past the window - so the retry must start on a fresh
+ * session with a bounded context. It differs from an oversized-prompt
+ * overflow in that the prompt was fine: what overflowed was the work the
+ * attempt did, so the retry must also carry the attempt's durable partial
+ * progress.
+ */
+function isTranscriptOverflowRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+) {
+  if (run.errorCode === TRANSCRIPT_OVERFLOW_ERROR_CODE) return true;
+  const resultJson = parseObject(run.resultJson);
+  return resultJson.errorCode === TRANSCRIPT_OVERFLOW_ERROR_CODE;
+}
+
+/**
+ * The partial progress a stopped attempt left behind, read off the run row.
+ *
+ * It rides on `resultJson.partialProgress`, which the adapter writes when it
+ * stops an attempt at the transcript budget.
+ */
+function readTranscriptPartialProgress(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+): string | null {
+  const resultJson = parseObject(run.resultJson);
+  const value = resultJson.partialProgress;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
 }
 
 function isMaxTurnExhaustionRun(
@@ -9129,6 +9167,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // identically. Mark the retry as a RE-SEED attempt so the next attempt
     // rebuilds the prompt from a bounded context instead (TON-868).
     const isContextOverflowRetry = isContextWindowOverflowRun(run);
+    // TON-1001: a run stopped at the transcript budget needs the same fresh
+    // session and bounded context as an oversized-prompt overflow, plus the
+    // attempt's durable partial progress so the next attempt resumes from
+    // the work that was done rather than from the transcript that overflowed.
+    const isTranscriptOverflowRetry = isTranscriptOverflowRun(run);
+    const transcriptPartialProgress = isTranscriptOverflowRetry
+      ? readTranscriptPartialProgress(run)
+      : null;
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
       ...contextSnapshot,
       retryOfRunId: run.id,
@@ -9136,6 +9182,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryReason,
       ...(isContextOverflowRetry
         ? buildContextReseedSnapshot({ sourceRunId: run.id, attempt: schedule.attempt })
+        : {}),
+      ...(isTranscriptOverflowRetry
+        ? buildContextReseedSnapshot({
+            sourceRunId: run.id,
+            attempt: schedule.attempt,
+            reason: CONTEXT_RESEED_REASON_TRANSCRIPT_OVERFLOW,
+            partialProgress: transcriptPartialProgress,
+          })
         : {}),
       ...(shouldQuarantineWorkspaceForRetry
         ? {
@@ -11583,7 +11637,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // context and needs to know the issue thread holds the authoritative
     // state.
     const finalTaskMarkdown =
-      taskMarkdown && reseedDirective ? `${taskMarkdown}\n\n${CONTEXT_RESEED_NOTE}` : taskMarkdown;
+      taskMarkdown && reseedDirective
+        ? `${taskMarkdown}\n\n${CONTEXT_RESEED_NOTE}${
+            reseedDirective.partialProgress
+              ? `\n\n${CONTEXT_RESEED_PARTIAL_PROGRESS_PREFIX}\n\n${reseedDirective.partialProgress}`
+              : ""
+          }`
+        : taskMarkdown;
     if (issueRef) {
       context.paperclipIssue = {
         id: issueRef.id,

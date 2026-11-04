@@ -25,6 +25,17 @@ export const CONTEXT_RESEED_KEY = "contextReseed";
 
 export const CONTEXT_RESEED_REASON = "context_overflow";
 
+/**
+ * The re-seed reason for a TRANSCRIPT overflow (TON-1001).
+ *
+ * A transcript overflow is not an oversized prompt: the prompt was fine and
+ * the attempt's own accumulated ACP transcript grew past the window. The
+ * retry therefore needs the same treatment (a fresh session and a bounded
+ * context) but a different label, so the run history can tell the two
+ * causes apart.
+ */
+export const CONTEXT_RESEED_REASON_TRANSCRIPT_OVERFLOW = "transcript_overflow";
+
 /** Budget for the issue description in a re-seeded prompt. */
 export const CONTEXT_RESEED_MAX_DESCRIPTION_CHARS = 4_000;
 
@@ -38,6 +49,7 @@ export type ContextReseedDirective = {
   reason: string;
   sourceRunId: string | null;
   attempt: number | null;
+  partialProgress: string | null;
 };
 
 export type BoundedText = {
@@ -76,6 +88,7 @@ export function readContextReseedDirective(context: unknown): ContextReseedDirec
     reason,
     sourceRunId: readNonEmptyString(raw.sourceRunId),
     attempt: asPositiveInt(raw.attempt),
+    partialProgress: readNonEmptyString(raw.partialProgress),
   };
 }
 
@@ -87,12 +100,15 @@ export function readContextReseedDirective(context: unknown): ContextReseedDirec
 export function buildContextReseedSnapshot(input: {
   sourceRunId: string;
   attempt?: number | null;
+  reason?: string;
+  partialProgress?: string | null;
 }): Record<string, unknown> {
   return {
     [CONTEXT_RESEED_KEY]: {
-      reason: CONTEXT_RESEED_REASON,
+      reason: input.reason ?? CONTEXT_RESEED_REASON,
       sourceRunId: input.sourceRunId,
       attempt: input.attempt ?? null,
+      ...(input.partialProgress ? { partialProgress: input.partialProgress } : {}),
     },
   };
 }
@@ -156,6 +172,20 @@ export const CONTEXT_RESEED_NOTE =
   "This prompt was re-seeded after a context-window overflow: the previous attempt's context was too large to fit. " +
   "The issue description, ancestor chain and continuation summary above may be truncated. " +
   "Read the issue thread for the authoritative state before acting.";
+
+/**
+ * The header for the partial progress a stopped attempt left behind.
+ *
+ * TON-1001: an attempt can be stopped because its OWN transcript grew past
+ * the context window. The work it did is not lost - it is carried here as
+ * durable state, so the next attempt resumes from the progress instead of
+ * from the transcript that overflowed.
+ */
+export const CONTEXT_RESEED_PARTIAL_PROGRESS_PREFIX =
+  "The previous attempt was stopped before it could overflow: its own accumulated transcript " +
+  "grew past the context window. Its partial progress follows - resume from it rather than " +
+  "re-doing the work, and keep this attempt's own transcript small (checkpoint progress to the " +
+  "issue as you go).";
 
 export type ReseedInputs = {
   description: string | null | undefined;
