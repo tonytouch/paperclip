@@ -438,6 +438,173 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(envFiles.filter((contents) => contents.includes("PAPERCLIP_API_KEY='second-key'"))).toHaveLength(1);
   });
 
+  it("keeps the wrapper script path stable across runs while the env file stays per run", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const baseConfig = {
+      agent: "custom-a",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+    };
+
+    const first = await runExecutor({
+      ...baseConfig,
+      env: { PAPERCLIP_API_KEY: "first-key" },
+    });
+    const second = await runExecutor({
+      ...baseConfig,
+      env: { PAPERCLIP_API_KEY: "second-key" },
+    });
+
+    const wrappers = await fs.readdir(path.join(stateDir, "wrappers"));
+    // One stable script path, one env file per run.
+    expect(wrappers.filter((name) => name.endsWith(".sh"))).toHaveLength(1);
+    expect(wrappers.filter((name) => name.endsWith(".env"))).toHaveLength(2);
+    // The persisted session command (the wrapper path) must not churn, or the
+    // session can never be reused and its wrapper can be swept.
+    const firstCommand = (first.runtimeOptions[0]?.agentRegistry as { resolve?: (agent: string) => string })?.resolve?.("custom-a");
+    const secondCommand = (second.runtimeOptions[0]?.agentRegistry as { resolve?: (agent: string) => string })?.resolve?.("custom-a");
+    expect(firstCommand).toBeTruthy();
+    expect(secondCommand).toBe(firstCommand);
+  });
+
+  it("keeps a wrapper that an open ACPX session still points at", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const wrappersDir = path.join(stateDir, "wrappers");
+    const sessionsDir = path.join(stateDir, "sessions");
+    await fs.mkdir(wrappersDir, { recursive: true });
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = {
+      agent: "custom-a",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+    };
+
+    const { result } = await runExecutor({
+      ...baseConfig,
+      env: { PAPERCLIP_API_KEY: "first-key" },
+    });
+    const sessionKey = String((result.sessionParams as Record<string, unknown> | undefined)?.sessionKey ?? "");
+    expect(sessionKey.length).toBeGreaterThan(0);
+
+    // A wrapper an open session still depends on, already past the cleanup age.
+    const openWrapperPath = path.join(wrappersDir, "custom-a-open.sh");
+    await fs.writeFile(openWrapperPath, "#!/usr/bin/env bash\nexec true\n", "utf8");
+    const oldDate = new Date(Date.now() - 16 * 60 * 1000);
+    await fs.utimes(openWrapperPath, oldDate, oldDate);
+    await fs.writeFile(
+      path.join(sessionsDir, `${encodeURIComponent(sessionKey)}.json`),
+      JSON.stringify({
+        acpx_record_id: sessionKey,
+        agent_command: openWrapperPath,
+        closed: false,
+      }),
+      "utf8",
+    );
+
+    await runExecutor({
+      ...baseConfig,
+      env: { PAPERCLIP_API_KEY: "second-key" },
+    });
+
+    // A session can stay open for days: age alone must not sweep its wrapper.
+    expect(await pathExists(openWrapperPath)).toBe(true);
+  });
+
+  it("sweeps a wrapper that only a closed ACPX session points at", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const wrappersDir = path.join(stateDir, "wrappers");
+    const sessionsDir = path.join(stateDir, "sessions");
+    await fs.mkdir(wrappersDir, { recursive: true });
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = {
+      agent: "custom-a",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+    };
+
+    const { result } = await runExecutor({
+      ...baseConfig,
+      env: { PAPERCLIP_API_KEY: "first-key" },
+    });
+    const sessionKey = String((result.sessionParams as Record<string, unknown> | undefined)?.sessionKey ?? "");
+
+    const closedWrapperPath = path.join(wrappersDir, "custom-a-closed.sh");
+    await fs.writeFile(closedWrapperPath, "#!/usr/bin/env bash\nexec true\n", "utf8");
+    const oldDate = new Date(Date.now() - 16 * 60 * 1000);
+    await fs.utimes(closedWrapperPath, oldDate, oldDate);
+    await fs.writeFile(
+      path.join(sessionsDir, `${encodeURIComponent(sessionKey)}.json`),
+      JSON.stringify({
+        acpx_record_id: sessionKey,
+        agent_command: closedWrapperPath,
+        closed: true,
+      }),
+      "utf8",
+    );
+
+    await runExecutor({
+      ...baseConfig,
+      env: { PAPERCLIP_API_KEY: "second-key" },
+    });
+
+    expect(await pathExists(closedWrapperPath)).toBe(false);
+  });
+
+  it("re-materialises the wrapper a session points at instead of failing with ENOENT", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const wrappersDir = path.join(stateDir, "wrappers");
+    const sessionsDir = path.join(stateDir, "sessions");
+    await fs.mkdir(wrappersDir, { recursive: true });
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = {
+      agent: "custom-a",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+    };
+
+    const { result } = await runExecutor({
+      ...baseConfig,
+      env: { PAPERCLIP_API_KEY: "first-key" },
+    });
+    const sessionKey = String((result.sessionParams as Record<string, unknown> | undefined)?.sessionKey ?? "");
+
+    // The wrapper the session persisted was deleted; ACPX would respawn this
+    // exact path and die with "Failed to spawn agent command".
+    const persistedWrapperPath = path.join(wrappersDir, "custom-a-persisted.sh");
+    await fs.writeFile(
+      path.join(sessionsDir, `${encodeURIComponent(sessionKey)}.json`),
+      JSON.stringify({
+        acpx_record_id: sessionKey,
+        agent_command: persistedWrapperPath,
+        closed: false,
+      }),
+      "utf8",
+    );
+
+    await runExecutor({
+      ...baseConfig,
+      env: { PAPERCLIP_API_KEY: "second-key" },
+    });
+
+    expect(await pathExists(persistedWrapperPath)).toBe(true);
+    const script = await fs.readFile(persistedWrapperPath, "utf8");
+    expect(script).toContain("node ./fake-acp.js");
+    // The respawned agent must not run under the previous run's credentials.
+    const envFilePath = script
+      .split("\n")
+      .find((line) => line.startsWith("# paperclip-wrapper-env-file="))
+      ?.slice("# paperclip-wrapper-env-file=".length)
+      .trim();
+    expect(envFilePath).toBeTruthy();
+    const env = await fs.readFile(envFilePath!, "utf8");
+    expect(env).toContain("PAPERCLIP_API_KEY='second-key'");
+    expect(env).not.toContain("first-key");
+  });
+
   it("enriches acpx.error diagnostics and child stderr when ensureSession rejects", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");

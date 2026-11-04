@@ -88,6 +88,16 @@ const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
  */
 const TRANSCRIPT_PARTIAL_PROGRESS_MAX_CHARS = 4_000;
 const WRAPPER_CLEANUP_RETENTION_MS = 15 * 60 * 1000;
+/** Marker line in a wrapper script that names the env file it sources. */
+const WRAPPER_ENV_FILE_MARKER = "# paperclip-wrapper-env-file=";
+
+type AcpxSessionRecord = {
+  agent_command?: unknown;
+  agentCommand?: unknown;
+  closed?: unknown;
+  cwd?: unknown;
+  name?: unknown;
+};
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
 
 type AcpxRuntimeFactory = (options: AcpRuntimeOptions) => AcpRuntime;
@@ -843,31 +853,45 @@ async function writePaperclipClaudeSettings(input: {
   };
 }
 
-async function writeAgentWrapper(input: {
-  stateDir: string;
+/**
+ * Stable identity of an agent wrapper script.
+ *
+ * The wrapper path must not churn per run. An ACPX session record persists the
+ * wrapper path as its `agent_command`, and ACPX respawns that exact path when
+ * the agent process has to come back. Hashing the run's env into the path (the
+ * historical behavior) gave every run a brand new path, so a session that
+ * stayed open pointed at a wrapper the cleanup sweep was free to delete.
+ *
+ * The identity is the agent, the command, the cwd and the task. The task is
+ * part of it so two runs of the same agent on different tasks never share a
+ * wrapper file (and therefore never share an env file).
+ */
+function agentWrapperStableKey(input: {
   acpxAgent: string;
   agentCommandShell: string;
-  env: Record<string, string>;
-  childStderrDir: string;
-}): Promise<{ wrapperPath: string; envFilePath: string }> {
-  const wrappersDir = path.join(input.stateDir, "wrappers");
-  await fs.mkdir(wrappersDir, { recursive: true });
-  const envLines = Object.entries(input.env)
-    .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
-  const wrapperHash = shortHash({
+  cwd: string;
+  taskKey: string;
+}): string {
+  return shortHash({
     agent: input.acpxAgent,
     command: input.agentCommandShell,
-    env: envLines,
-    childStderrDir: input.childStderrDir,
+    cwd: path.resolve(input.cwd),
+    task: input.taskKey,
   });
-  const wrapperPath = path.join(wrappersDir, `${input.acpxAgent}-${wrapperHash}.sh`);
-  const envFilePath = path.join(wrappersDir, `${input.acpxAgent}-${wrapperHash}.env`);
-  const script = [
+}
+
+function buildAgentWrapperScript(input: {
+  envFilePath: string;
+  agentCommandShell: string;
+  childStderrDir: string;
+}): string {
+  return [
     "#!/usr/bin/env bash",
     "set -euo pipefail",
-    `env_file=${shellQuote(envFilePath)}`,
+    // Machine-readable marker so the wrapper's env file can be recovered
+    // without re-deriving the naming scheme.
+    `${WRAPPER_ENV_FILE_MARKER}${input.envFilePath}`,
+    `env_file=${shellQuote(input.envFilePath)}`,
     "if [[ -f \"$env_file\" ]]; then",
     "  set -a",
     "  source \"$env_file\"",
@@ -883,6 +907,40 @@ async function writeAgentWrapper(input: {
     `exec ${input.agentCommandShell} "$@"`,
     "",
   ].join("\n");
+}
+
+async function writeAgentWrapper(input: {
+  stateDir: string;
+  acpxAgent: string;
+  agentCommandShell: string;
+  env: Record<string, string>;
+  childStderrDir: string;
+  cwd: string;
+  taskKey: string;
+}): Promise<{ wrapperPath: string; envFilePath: string; script: string }> {
+  const wrappersDir = path.join(input.stateDir, "wrappers");
+  await fs.mkdir(wrappersDir, { recursive: true });
+  const envLines = Object.entries(input.env)
+    .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+  const stableKey = agentWrapperStableKey({
+    acpxAgent: input.acpxAgent,
+    agentCommandShell: input.agentCommandShell,
+    cwd: input.cwd,
+    taskKey: input.taskKey,
+  });
+  // The env file stays per run (keyed by its contents) so concurrent runs with
+  // different credentials never share one, while the wrapper script path stays
+  // stable so a session's persisted `agent_command` survives.
+  const envKey = shortHash(envLines);
+  const wrapperPath = path.join(wrappersDir, `${input.acpxAgent}-${stableKey}.sh`);
+  const envFilePath = path.join(wrappersDir, `${input.acpxAgent}-${stableKey}-${envKey}.env`);
+  const script = buildAgentWrapperScript({
+    envFilePath,
+    agentCommandShell: input.agentCommandShell,
+    childStderrDir: input.childStderrDir,
+  });
   await writeFileAtomically({
     target: envFilePath,
     contents: `${envLines.join("\n")}\n`,
@@ -895,12 +953,85 @@ async function writeAgentWrapper(input: {
   });
   await cleanupStaleAgentWrappers({
     wrappersDir,
+    stateDir: input.stateDir,
     currentFileNames: new Set([path.basename(wrapperPath), path.basename(envFilePath)]),
   });
-  return { wrapperPath, envFilePath };
+  return { wrapperPath, envFilePath, script };
 }
 
-async function cleanupStaleAgentWrappers(input: { wrappersDir: string; currentFileNames: Set<string> }) {
+function isInsideDir(candidate: string, dir: string): boolean {
+  const relative = path.relative(path.resolve(dir), path.resolve(candidate));
+  return relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+async function readAcpxSessionRecord(filePath: string): Promise<AcpxSessionRecord | null> {
+  const raw = await fs.readFile(filePath, "utf8").catch(() => null);
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as AcpxSessionRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The wrapper path an ACPX session record was created with, if any. */
+function sessionRecordWrapperPath(record: AcpxSessionRecord | null): string | null {
+  if (!record) return null;
+  const command = (asString(record.agent_command, "") || asString(record.agentCommand, "")).trim();
+  if (!command) return null;
+  // The persisted command is a command line; the wrapper path is its first token.
+  const first = command.split(/\s+/)[0] ?? "";
+  return first.length > 0 ? first : null;
+}
+
+async function readWrapperEnvFilePath(wrapperPath: string): Promise<string | null> {
+  const script = await fs.readFile(wrapperPath, "utf8").catch(() => null);
+  if (script === null) return null;
+  for (const line of script.split("\n")) {
+    if (!line.startsWith(WRAPPER_ENV_FILE_MARKER)) continue;
+    const value = line.slice(WRAPPER_ENV_FILE_MARKER.length).trim();
+    if (value.length > 0) return value;
+  }
+  return null;
+}
+
+/**
+ * Wrapper paths that a still-open ACPX session depends on.
+ *
+ * A session may legitimately stay open for days, so age alone must never
+ * decide a wrapper's life: any wrapper a non-closed session record points at
+ * is protected, together with the env file that wrapper sources.
+ */
+async function collectOpenSessionWrapperPaths(stateDir: string): Promise<Set<string>> {
+  const wrappersDir = path.join(stateDir, "wrappers");
+  const sessionsDir = path.join(stateDir, "sessions");
+  const protectedPaths = new Set<string>();
+  const records = await fs.readdir(sessionsDir).catch(() => []);
+  await Promise.all(
+    records
+      .filter((name) => name.endsWith(".json"))
+      .map(async (name) => {
+        const record = await readAcpxSessionRecord(path.join(sessionsDir, name));
+        if (!record || record.closed === true) return;
+        const wrapperPath = sessionRecordWrapperPath(record);
+        if (!wrapperPath) return;
+        const resolved = path.resolve(wrapperPath);
+        if (!isInsideDir(resolved, wrappersDir)) return;
+        protectedPaths.add(resolved);
+        const envFilePath = await readWrapperEnvFilePath(resolved);
+        if (envFilePath) protectedPaths.add(path.resolve(envFilePath));
+      }),
+  );
+  return protectedPaths;
+}
+
+async function cleanupStaleAgentWrappers(input: {
+  wrappersDir: string;
+  stateDir: string;
+  currentFileNames: Set<string>;
+}) {
+  const protectedPaths = await collectOpenSessionWrapperPaths(input.stateDir);
   const wrappers = await fs.readdir(input.wrappersDir).catch(() => []);
   const now = Date.now();
   await Promise.all(
@@ -908,11 +1039,52 @@ async function cleanupStaleAgentWrappers(input: { wrappersDir: string; currentFi
       const isManagedWrapperFile = name.endsWith(".sh") || name.endsWith(".env");
       if (!isManagedWrapperFile || input.currentFileNames.has(name)) return;
       const wrapperPath = path.join(input.wrappersDir, name);
+      const resolved = path.resolve(wrapperPath);
+      if (protectedPaths.has(resolved)) return;
       const stats = await fs.stat(wrapperPath).catch(() => null);
       if (!stats || now - stats.mtimeMs < WRAPPER_CLEANUP_RETENTION_MS) return;
+      // Read the env file pointer before the script goes away: a wrapper and
+      // its env file are written as a pair.
+      const envFilePath = name.endsWith(".sh") ? await readWrapperEnvFilePath(wrapperPath) : null;
       await fs.rm(wrapperPath, { force: true });
+      if (!envFilePath) return;
+      const resolvedEnv = path.resolve(envFilePath);
+      if (protectedPaths.has(resolvedEnv)) return;
+      if (input.currentFileNames.has(path.basename(resolvedEnv))) return;
+      await fs.rm(resolvedEnv, { force: true }).catch(() => {});
     }),
   );
+}
+
+/**
+ * Re-materialise the wrapper an ACPX session record points at.
+ *
+ * ACPX respawns the exact command a session record persisted. When that file
+ * was swept (or predates the stable-path layout) the respawn dies with
+ * ENOENT ("Failed to spawn agent command"). Rewriting the persisted path with
+ * the current run's script keeps the session resumable and hands the respawned
+ * agent the current run's credentials instead of the previous run's.
+ *
+ * Only an open session is materialised: a closed session is not resumable, so
+ * its wrapper stays eligible for the age-based sweep.
+ */
+export async function materializeSessionWrapper(input: {
+  stateDir: string;
+  sessionKey: string;
+  wrapperPath: string;
+  script: string;
+}): Promise<string | null> {
+  const record = await readAcpxSessionRecord(
+    path.join(input.stateDir, "sessions", `${encodeURIComponent(input.sessionKey)}.json`),
+  );
+  if (!record || record.closed === true) return null;
+  const persistedPath = sessionRecordWrapperPath(record);
+  if (!persistedPath) return null;
+  const resolved = path.resolve(persistedPath);
+  if (resolved === path.resolve(input.wrapperPath)) return null;
+  if (!isInsideDir(resolved, path.join(input.stateDir, "wrappers"))) return null;
+  await writeFileAtomically({ target: resolved, contents: input.script, mode: 0o700 });
+  return resolved;
 }
 
 async function buildRuntime(input: {
@@ -1101,6 +1273,7 @@ async function buildRuntime(input: {
   }
   const childStderrDir = path.join(stateDir, "run-stderr");
   const childStderrLogPath = agentCommand ? path.join(childStderrDir, `${runId}.log`) : null;
+  const taskKey = asString(input.ctx.runtime.taskKey, "") || wakeTaskId || workspaceId || "default";
   const wrapper = agentCommand
     ? await writeAgentWrapper({
         stateDir,
@@ -1108,6 +1281,8 @@ async function buildRuntime(input: {
         agentCommandShell,
         env,
         childStderrDir,
+        cwd,
+        taskKey,
       })
     : null;
   const wrapperPath = wrapper?.wrapperPath ?? null;
@@ -1135,8 +1310,20 @@ async function buildRuntime(input: {
       : null,
     secretManifestHash: shortHash(secretManifest),
   });
-  const taskKey = asString(input.ctx.runtime.taskKey, "") || wakeTaskId || workspaceId || "default";
   const sessionKey = `paperclip:${agent.companyId}:${agent.id}:${taskKey}:${fingerprint}`;
+  if (wrapper) {
+    // The session record persists the wrapper path ACPX respawns. Restore it
+    // when it points somewhere this run did not write (a swept file, or a
+    // record created before the stable-path layout) so the respawn finds a
+    // usable wrapper instead of failing with ENOENT, and so it runs with this
+    // run's credentials rather than the previous run's.
+    await materializeSessionWrapper({
+      stateDir,
+      sessionKey,
+      wrapperPath: wrapper.wrapperPath,
+      script: wrapper.script,
+    });
+  }
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   const loggedEnv = buildInvocationEnvForLogs(env, {
     runtimeEnv,
