@@ -28,7 +28,7 @@ deployed tree is the one serving on `127.0.0.1:3100`.
 | | |
 |---|---|
 | Deployed tree | `/home/tony/tonysplace_best/workspace/paperclip` |
-| Deployed branch | `ton/ton-809-manager-boundary` |
+| Deployed branch | whatever local branch the tree is on — the invariant is the **upstream**, not the local branch name (TON-1129) |
 | Tracked upstream | `fork/ton/deployed-long-active-fix` ✅ |
 | Durable remote | `fork` = `https://github.com/tonytouch/paperclip.git` (judged by **URL**, not by name) |
 | `origin` | `https://github.com/paperclipai/paperclip.git` — **upstream, never deploy from it** |
@@ -76,6 +76,14 @@ bash /home/tony/tonysplace_best/workspace/paperclip/scripts/repin-deployed-linea
 The `post-checkout` hook now re-establishes the pin itself: after a branch checkout it points a
 branch that has no upstream at the durable branch. The broken state is healed where it is created,
 not discovered later by a guard.
+
+Because the hooks are installed as **copies** of the tracked `scripts/git-hooks/*`, changing a
+tracked hook makes the installed copy drift, and the guard fails closed on drift. After any commit
+that touches `scripts/git-hooks/`, re-run the installer:
+
+```bash
+bash /home/tony/tonysplace_best/workspace/paperclip/scripts/install-deployed-lineage-guard.sh
+```
 
 ## The one command to redeploy
 
