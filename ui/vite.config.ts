@@ -5,6 +5,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { createUiDevWatchOptions } from "./src/lib/vite-watch";
 
 export default defineConfig(({ mode }) => ({
+  base: process.env.VITE_BASE_PATH || "./",
   plugins: [react(), tailwindcss()],
   build: {
     minify: "esbuild",

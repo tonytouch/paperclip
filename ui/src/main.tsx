@@ -22,6 +22,37 @@ import "./index.css";
 
 initPluginBridge(React, ReactDOM);
 
+if (typeof window !== "undefined" && window.location.pathname.startsWith("/paperclip")) {
+  const originalFetch = window.fetch;
+  window.fetch = function (input: RequestInfo | URL, init?: RequestInit) {
+    if (typeof input === "string") {
+      if (input.startsWith("/api/")) {
+        input = "/paperclip" + input;
+      }
+    } else if (input instanceof URL) {
+      if (input.origin === window.location.origin && input.pathname.startsWith("/api/")) {
+        input = new URL("/paperclip" + input.pathname + input.search, window.location.origin);
+      }
+    }
+    return originalFetch.call(this, input, init);
+  };
+
+  const OriginalWS = window.WebSocket;
+  // @ts-expect-error monkey patch WebSocket for subpath routing
+  window.WebSocket = function (url: string | URL, protocols?: string | string[]) {
+    let u = typeof url === "string" ? url : url.toString();
+    try {
+      const parsed = new URL(u);
+      if (parsed.host === window.location.host && parsed.pathname.startsWith("/api/")) {
+        parsed.pathname = "/paperclip" + parsed.pathname;
+        u = parsed.toString();
+      }
+    } catch (_) {}
+    return new OriginalWS(u, protocols);
+  };
+}
+
+
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
     navigator.serviceWorker.register("/sw.js");
@@ -46,7 +77,7 @@ createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <ThemeProvider>
-        <BrowserRouter>
+        <BrowserRouter basename={typeof window !== "undefined" && window.location.pathname.startsWith("/paperclip") ? "/paperclip" : undefined}>
           <CompanyProvider>
             <EditorAutocompleteProvider>
               <ToastProvider>

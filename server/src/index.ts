@@ -999,6 +999,9 @@ export async function startServer(): Promise<StartedServer> {
         // persisted queued work is still being driven forward.
         trackHeartbeatSchedulerWork(heartbeat
           .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+          // TON-1112: reclaim slots held by runs that stopped making progress
+          // before deciding who gets the queue.
+          .then(() => heartbeat.reclaimStalledRunningRuns())
           .then(() => heartbeat.promoteDueScheduledRetries())
           .then(async (promotion) => {
             await heartbeat.resumeQueuedRuns();

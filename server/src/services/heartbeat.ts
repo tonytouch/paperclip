@@ -309,6 +309,18 @@ const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retr
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
+// TON-1112: a queued run has no age bound today, so a starved lane is
+// indistinguishable from a healthy queue wait. Default to 4h: long enough that
+// a healthy wait is never cut short, short enough that an 8h wait is visible.
+const DEFAULT_MAX_QUEUED_RUN_AGE_SEC = 4 * 60 * 60;
+// TON-1112: a running run that stops producing useful actions holds its seat's
+// concurrency slot forever. Same 4h default; operators can tighten it per seat.
+const DEFAULT_MAX_STALLED_RUN_AGE_SEC = 4 * 60 * 60;
+// How many times a single issue may be re-queued after a `queued_run_stale`
+// cancel before we stop re-queueing it and let the liveness path escalate.
+const MAX_QUEUED_STALE_REQUEUES_PER_ISSUE = 3;
+const QUEUED_RUN_STALE_ERROR_CODE = "queued_run_stale";
+const STALLED_RUN_ERROR_CODE = "run_stalled_no_progress";
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -9971,6 +9983,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+      // TON-1112: age bounds for queued and stalled runs. `null` means "not
+      // configured"; the resolver falls back to the defaults. An explicit 0
+      // disables the bound for a seat that opts out.
+      maxQueuedRunAgeSec: normalizeOptionalNonNegativeInteger(
+        heartbeat.maxQueuedRunAgeSec ?? heartbeat.queuedRunMaxAgeSec,
+      ),
+      maxStalledRunAgeSec: normalizeOptionalNonNegativeInteger(
+        heartbeat.maxStalledRunAgeSec ?? heartbeat.stalledRunMaxAgeSec,
+      ),
       skipTimerWhenNoActionableWork: asBoolean(
         heartbeat.skipTimerWhenNoActionableWork ??
           heartbeat.requireActionableTimerWork ??
@@ -9993,6 +10014,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (value === null || value === undefined || value === "") return null;
     const normalized = Math.floor(asNumber(value, 0));
     return normalized >= 0 ? normalized : null;
+  }
+
+  // TON-1112: resolve the queued-run age bound in milliseconds. A configured
+  // 0 explicitly disables the bound; an unconfigured seat uses the default.
+  function resolveMaxQueuedRunAgeMs(policy: { maxQueuedRunAgeSec: number | null }): number {
+    const seconds = policy.maxQueuedRunAgeSec ?? DEFAULT_MAX_QUEUED_RUN_AGE_SEC;
+    return seconds > 0 ? seconds * 1000 : 0;
+  }
+
+  // TON-1112: resolve the stalled-running-run age bound in milliseconds.
+  function resolveMaxStalledRunAgeMs(policy: { maxStalledRunAgeSec: number | null }): number {
+    const seconds = policy.maxStalledRunAgeSec ?? DEFAULT_MAX_STALLED_RUN_AGE_SEC;
+    return seconds > 0 ? seconds * 1000 : 0;
+  }
+
+  function formatDurationMs(ms: number): string {
+    const totalMinutes = Math.max(0, Math.floor(ms / 60_000));
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours <= 0) return `${minutes}m`;
+    return `${hours}h${minutes > 0 ? `${minutes}m` : ""}`;
   }
 
   function currentUtcDayWindow(now = new Date()) {
@@ -10263,7 +10305,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return null;
       }
 
-      const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
+      const staleness = await evaluateQueuedRunStaleness(run, issueId, context, {
+        maxQueuedRunAgeMs: resolveMaxQueuedRunAgeMs(parseHeartbeatPolicy(agent)),
+      });
       if (staleness.stale) {
         await cancelQueuedRunForStaleIssue(run, issueId, staleness);
         logger.info(
@@ -10413,7 +10457,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
           | "issue_review_participant_changed"
-          | "issue_continuation_waiting_on_review";
+          | "issue_continuation_waiting_on_review"
+          | "queued_run_stale";
         details: Record<string, unknown>;
       };
 
@@ -10421,7 +10466,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
     context: Record<string, unknown>,
+    options?: { maxQueuedRunAgeMs?: number },
   ): Promise<QueuedRunStaleness> {
+    // TON-1112: the age bound. Every other reason below is state-based, so a
+    // queued run whose issue stays healthy and correctly assigned waits
+    // forever. This is the term that makes a starved lane visible.
+    const maxQueuedRunAgeMs = options?.maxQueuedRunAgeMs ?? 0;
+    if (maxQueuedRunAgeMs > 0) {
+      const queuedSince = run.startedAt ?? run.createdAt;
+      const ageMs = Date.now() - queuedSince.getTime();
+      if (ageMs >= maxQueuedRunAgeMs) {
+        return {
+          stale: true,
+          errorCode: "queued_run_stale",
+          reason: `Cancelled because the run waited ${formatDurationMs(ageMs)} in the queue without starting (bound ${formatDurationMs(maxQueuedRunAgeMs)})`,
+          details: {
+            issueId,
+            queuedSince: queuedSince.toISOString(),
+            ageMs,
+            maxQueuedRunAgeMs,
+          },
+        };
+      }
+    }
     const issue = await db
       .select({
         id: issues.id,
@@ -10615,7 +10682,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
     }
 
+    // TON-1112: a stale queued run is cancelled so the starvation becomes
+    // visible, but the work itself must not be dropped — otherwise the issue is
+    // stranded `in_progress` with no execution path (the TON-1021 shape) and
+    // the lane dies quietly. Re-queue the same issue instead.
+    if (staleness.errorCode === QUEUED_RUN_STALE_ERROR_CODE) {
+      await requeueWorkAfterStaleQueuedCancel(cancelled, issueId);
+    }
+
     return cancelled;
+  }
+
+  // TON-1112: re-queue the work behind a `queued_run_stale` cancel.
+  //
+  // Bounded on purpose: a permanently saturated seat would otherwise spin
+  // cancel -> re-queue -> age -> cancel forever. After the budget is spent we
+  // stop re-queueing and let the liveness/review path escalate the issue.
+  async function requeueWorkAfterStaleQueuedCancel(
+    cancelledRun: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+  ): Promise<{ requeued: boolean; reason: string }> {
+    const issue = await db
+      .select({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, cancelledRun.companyId)))
+      .then((rows) => rows[0] ?? null);
+
+    if (!issue) return { requeued: false, reason: "issue_not_found" };
+    if (issue.status === "done" || issue.status === "cancelled") {
+      return { requeued: false, reason: "issue_terminal_status" };
+    }
+    if (issue.assigneeAgentId !== cancelledRun.agentId) {
+      return { requeued: false, reason: "issue_assignee_changed" };
+    }
+
+    const priorStaleCancels = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, cancelledRun.companyId),
+        eq(heartbeatRuns.errorCode, QUEUED_RUN_STALE_ERROR_CODE),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+      ))
+      .then((rows) => Number(rows[0]?.count ?? 0));
+
+    if (priorStaleCancels > MAX_QUEUED_STALE_REQUEUES_PER_ISSUE) {
+      logger.warn(
+        { runId: cancelledRun.id, issueId, priorStaleCancels },
+        "queued_run_stale: requeue budget exhausted; leaving the issue stranded for liveness escalation",
+      );
+      return { requeued: false, reason: "requeue_budget_exhausted" };
+    }
+
+    const wake = await enqueueWakeup(cancelledRun.agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: QUEUED_RUN_STALE_ERROR_CODE,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "stale_queued_run_requeue",
+      },
+    });
+
+    logger.warn(
+      { runId: cancelledRun.id, issueId, priorStaleCancels, requeued: Boolean(wake) },
+      "queued_run_stale: cancelled a stale queued run and re-queued the work",
+    );
+    return { requeued: Boolean(wake), reason: "requeued" };
   }
 
   function truncateAgentErrorReason(reason: string | null | undefined): string | null {
@@ -11063,9 +11200,87 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  // TON-1112: reclaim the concurrency slot held by a run that has stopped
+  // producing useful actions.
+  //
+  // Today a wedged run holds its seat's slot for hours: on the CTO seat
+  // `countRunningRunsForAgent` measured 10 `running` rows against a
+  // `maxConcurrentRuns` of 4 for ~4.4h, so every queued run on that seat
+  // waited behind it (TON-1020's run sat 8.6h in the queue).
+  //
+  // The bound is measured from *useful progress* (`lastUsefulActionAt`), not
+  // from the row's `updatedAt`: a runtime-progress ping or a keepalive
+  // refreshes `updatedAt` and would mask a run that is doing nothing at all.
+  async function reclaimStalledRunningRuns(opts?: { maxStalledRunAgeMs?: number }) {
+    const now = new Date();
+    const activeRuns = await db
+      .select({ run: heartbeatRuns, agent: agents })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.status, "running"));
+
+    const reclaimedRunIds: string[] = [];
+
+    for (const { run, agent } of activeRuns) {
+      const maxStalledRunAgeMs = opts?.maxStalledRunAgeMs
+        ?? resolveMaxStalledRunAgeMs(parseHeartbeatPolicy(agent));
+      if (maxStalledRunAgeMs <= 0) continue;
+
+      const progressAt = run.lastUsefulActionAt ?? run.startedAt ?? run.createdAt;
+      const ageMs = now.getTime() - progressAt.getTime();
+      if (ageMs < maxStalledRunAgeMs) continue;
+
+      // The seat is out of slots precisely because this run is holding one.
+      // Stop the child process first so the slot is not immediately re-taken.
+      await terminateHeartbeatRunProcess({
+        pid: run.processPid,
+        processGroupId: run.processGroupId,
+      });
+
+      const finalized = await setRunStatus(run.id, "failed", {
+        error: `Run reclaimed after ${formatDurationMs(ageMs)} without a useful action (bound ${formatDurationMs(maxStalledRunAgeMs)})`,
+        errorCode: STALLED_RUN_ERROR_CODE,
+        finishedAt: now,
+        resultJson: {
+          ...parseObject(run.resultJson),
+          stopReason: STALLED_RUN_ERROR_CODE,
+          timeoutFired: false,
+        },
+      });
+      if (!finalized) continue;
+
+      reclaimedRunIds.push(run.id);
+
+      await appendRunEvent(finalized, await nextRunEventSeq(finalized.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `Run reclaimed after ${formatDurationMs(ageMs)} without a useful action`,
+        payload: {
+          ageMs,
+          maxStalledRunAgeMs,
+          lastUsefulActionAt: run.lastUsefulActionAt?.toISOString() ?? null,
+          startedAt: run.startedAt?.toISOString() ?? null,
+        },
+      });
+
+      // Release the issue execution lock and hand the freed slot straight to
+      // the queue, so the lane this run was starving gets to run.
+      await releaseIssueExecutionAndPromote(finalized);
+      await startNextQueuedRunForAgent(run.agentId);
+    }
+
+    if (reclaimedRunIds.length > 0) {
+      logger.warn(
+        { reclaimedCount: reclaimedRunIds.length, runIds: reclaimedRunIds },
+        "reclaimed stalled heartbeat runs and released their concurrency slots",
+      );
+    }
+    return { reclaimed: reclaimedRunIds.length, runIds: reclaimedRunIds };
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
-
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
@@ -16318,6 +16533,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    reclaimStalledRunningRuns,
 
     scheduleBoundedRetry: async (
       runId: string,
