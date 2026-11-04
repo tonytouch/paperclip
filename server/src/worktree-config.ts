@@ -137,6 +137,22 @@ function resolveWorktreeRuntimeContext(
       "~/.paperclip-worktrees",
   );
   const instanceRoot = path.resolve(homeDir, "instances", instanceId);
+  // A worktree process must never "repair" the main instance. If the config it
+  // resolved lives under ~/.paperclip/instances while its own home is elsewhere,
+  // repairing would point production at the worktree database and ports (the
+  // 2026-11-04 incident). Fail startup instead of falling back to that config,
+  // which would put this process on the production database.
+  const mainHome = path.resolve(os.homedir(), ".paperclip");
+  if (
+    isPathInside(configPath, path.resolve(mainHome, "instances")) &&
+    path.resolve(homeDir) !== mainHome
+  ) {
+    throw new Error(
+      `Refusing to start a worktree instance (PAPERCLIP_IN_WORKTREE=true, home ${homeDir}) ` +
+        `against the main Paperclip instance config ${configPath}. ` +
+        "Set PAPERCLIP_CONFIG to the worktree config instead.",
+    );
+  }
 
   return {
     configPath,

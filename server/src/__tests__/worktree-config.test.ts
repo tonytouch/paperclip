@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   applyRuntimePortSelectionToConfig,
   maybePersistWorktreeRuntimePorts,
@@ -10,6 +10,13 @@ import {
 
 const ORIGINAL_ENV = { ...process.env };
 const ORIGINAL_CWD = process.cwd();
+
+// Agents run this suite with the server env, which carries PAPERCLIP_CONFIG for
+// the real instance. Never let a test resolve the real home or config.
+beforeEach(async () => {
+  process.env.HOME = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-test-home-"));
+  delete process.env.PAPERCLIP_CONFIG;
+});
 
 afterEach(() => {
   process.chdir(ORIGINAL_CWD);
@@ -689,5 +696,34 @@ describe("worktree config repair", () => {
     expect(config.server.port).toBe(3100);
     expect(config.database.embeddedPostgresPort).toBe(54340);
     expect(config.auth.publicBaseUrl).toBe("https://paperclip.example");
+  });
+});
+
+describe("worktree mode never rewrites the main instance", () => {
+  it("refuses to start and leaves the main config and env untouched", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-main-guard-"));
+    const mainInstance = path.join(tempRoot, ".paperclip", "instances", "default");
+    const configPath = path.join(mainInstance, "config.json");
+    const envPath = path.join(mainInstance, ".env");
+    const config = JSON.stringify(buildLegacyConfig(mainInstance), null, 2) + "\n";
+    const env = "PAPERCLIP_AGENT_JWT_SECRET=main-secret\n";
+    await fs.mkdir(mainInstance, { recursive: true });
+    await fs.writeFile(configPath, config, "utf8");
+    await fs.writeFile(envPath, env, "utf8");
+
+    process.env.HOME = tempRoot;
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREE_NAME = "PAP-884-ai-commits-component";
+    process.env.PAPERCLIP_HOME = path.join(tempRoot, "run", ".paperclip-worktrees");
+    process.env.PAPERCLIP_CONFIG = configPath;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    expect(() => maybeRepairLegacyWorktreeConfigAndEnvFiles()).toThrow(/main Paperclip instance/);
+    expect(() => maybePersistWorktreeRuntimePorts({ serverPort: 3101, databasePort: 54330 })).toThrow(
+      /main Paperclip instance/,
+    );
+    expect(await fs.readFile(configPath, "utf8")).toBe(config);
+    expect(await fs.readFile(envPath, "utf8")).toBe(env);
   });
 });
