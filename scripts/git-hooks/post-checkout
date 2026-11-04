@@ -6,6 +6,19 @@
 # remote is renamed) removes server/src/services/productivity-review.ts and the
 # long_active_duration fix in a single move. This hook catches that at the
 # moment it happens and puts the operator back on the durable branch.
+#
+# TON-1129 - ALSO re-establish the lineage pin after a branch checkout.
+#
+#   This hook is where the pin broke on 2026-11-04. `git checkout -b X` cut
+#   from a LOCAL branch (the deployed tree's `master`) produces a branch with
+#   NO upstream: git only inherits an upstream when the start point is a
+#   remote-tracking branch. The deployed tree was left on that branch, the
+#   guard failed closed, and every redeploy was refused - with the pin
+#   existing only in local git config, invisible to `git log` and to a clone.
+#
+#   So: after a branch checkout, if the new branch has no upstream, point it
+#   at the durable branch. Every branch in the deployed tree must track the
+#   durable branch; that is the invariant the guard checks.
 
 set -uo pipefail
 
@@ -41,6 +54,20 @@ if ! grep -q "$MARKER" "$SERVICE" 2>/dev/null; then
   echo "  $SERVICE on the target branch does not contain the $MARKER fix." >&2
   echo "  Run: git checkout $DURABLE" >&2
   exit 1
+fi
+
+# TON-1129 - re-establish the pin. A branch with no upstream is exactly the
+# broken state the guard refuses to deploy from, and it is invisible outside
+# this clone's git config - so heal it at the moment it is created.
+current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+current_upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo none)"
+
+if [ "$current_upstream" = "none" ] && [ "$current_branch" != "HEAD" ]; then
+  if git rev-parse --verify "refs/remotes/$DURABLE" >/dev/null 2>&1; then
+    if git branch --set-upstream-to="$DURABLE" "$current_branch" >/dev/null 2>&1; then
+      echo "post-checkout: re-pinned '$current_branch' to $DURABLE (the branch had no upstream)."
+    fi
+  fi
 fi
 
 exit 0

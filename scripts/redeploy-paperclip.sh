@@ -34,8 +34,15 @@
 set -uo pipefail
 
 REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}"
-DURABLE_REMOTE="${PAPERCLIP_DURABLE_REMOTE:-fork}"
-DURABLE_BRANCH="${PAPERCLIP_DURABLE_BRANCH:-ton/deployed-long-active-fix}"
+# TON-1129 - read the COMMITTED pin (scripts/deployed-lineage-guard.conf) rather
+# than hardcoding it, so the deployed lineage is defined by a versioned
+# artifact and not by local git config. Env vars still override.
+PIN_CONF="$REPO/scripts/deployed-lineage-guard.conf"
+conf_get() { sed -n "s/^$1=//p" "$PIN_CONF" 2>/dev/null | head -n 1; }
+DURABLE_REMOTE="${PAPERCLIP_DURABLE_REMOTE:-$(conf_get DEPLOYED_DURABLE_REMOTE)}"
+DURABLE_REMOTE="${DURABLE_REMOTE:-fork}"
+DURABLE_BRANCH="${PAPERCLIP_DURABLE_BRANCH:-$(conf_get DEPLOYED_DURABLE_BRANCH)}"
+DURABLE_BRANCH="${DURABLE_BRANCH:-ton/deployed-long-active-fix}"
 SERVICE="server/src/services/productivity-review.ts"
 TESTFILE="server/src/__tests__/productivity-review-service.test.ts"
 MARKER="findLiveContinuationPath"

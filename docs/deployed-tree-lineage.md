@@ -43,6 +43,40 @@ cd /home/tony/tonysplace_best/workspace/paperclip
 git rev-parse --abbrev-ref --symbolic-full-name '@{u}'   # must print fork/ton/deployed-long-active-fix
 ```
 
+### The pin is a committed artifact (TON-1129)
+
+The pin used to live **only** in the deployed tree's local git config
+(`branch.<name>.remote` / `branch.<name>.merge`). Local config is not an artifact: it does not
+appear in `git log`, it is not carried by a clone, and it is dropped the moment a branch is cut
+from a *local* branch — `git checkout -b X` inherits an upstream only when the start point is a
+remote-tracking branch.
+
+On 2026-11-04 the deployed tree was moved to `ton/ton-1112-queued-run-age-bound`, cut from the
+local `master`. The branch ended up with `upstream=none`, the guard failed closed, and **every
+redeploy was refused** — with the pin invisible in the repository. The tree was one
+`git branch --set-upstream-to` away from being deployable, but nothing in the repo recorded what
+the pin was supposed to be.
+
+Two changes make it durable:
+
+1. `scripts/deployed-lineage-guard.conf` — the pin as a versioned file on the durable branch:
+   the durable branch, the durable remote, the URL patterns, the fix commit, the service. The
+   guard, the redeploy script and the repair script all read it; env vars still override.
+2. `scripts/repin-deployed-lineage.sh` — the repair. Idempotent, and it only touches the current
+   branch's upstream pointer. It never checks out, resets, merges or pulls, so it cannot disturb
+   a working tree that carries other work.
+
+```bash
+# check the pin without changing anything
+bash /home/tony/tonysplace_best/workspace/paperclip/scripts/repin-deployed-lineage.sh --check-only
+# repair it, then let the guard confirm
+bash /home/tony/tonysplace_best/workspace/paperclip/scripts/repin-deployed-lineage.sh
+```
+
+The `post-checkout` hook now re-establishes the pin itself: after a branch checkout it points a
+branch that has no upstream at the durable branch. The broken state is healed where it is created,
+not discovered later by a guard.
+
 ## The one command to redeploy
 
 ```bash

@@ -38,29 +38,53 @@ DEFAULT_REPO="$(cd "$GUARD_DIR/.." 2>/dev/null && pwd)"
 # The installed copy lives outside the repo (~/.local/share/paperclip-guard), so
 # the derived parent is not a git tree; fall back to the known deployed tree in
 # that case. The systemd unit also sets PAPERCLIP_DEPLOYED_REPO explicitly.
-if [ -n "$DEFAULT_REPO" ] && [ -d "$DEFAULT_REPO/.git" ]; then
+# -e, not -d: in a LINKED worktree .git is a file, and the guard must still
+# guard the tree it lives in rather than silently validating the deployed tree.
+if [ -n "$DEFAULT_REPO" ] && [ -e "$DEFAULT_REPO/.git" ]; then
   REPO="${PAPERCLIP_DEPLOYED_REPO:-$DEFAULT_REPO}"
 else
   REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}"
 fi
-FIX_COMMIT="fa3c22dd14a2502ed055ef6e7c309478ff7d5346"
-DURABLE_REMOTE="${PAPERCLIP_DURABLE_REMOTE:-fork}"
-DURABLE_BRANCH="${PAPERCLIP_DURABLE_BRANCH:-ton/deployed-long-active-fix}"
+# TON-1129 - the pin is a COMMITTED artifact, not a hardcoded constant and
+# not local git config. scripts/deployed-lineage-guard.conf on the durable
+# branch says which branch/remote the deployed tree must track; this guard
+# reads it, so a fresh clone knows the invariant without a human.
+# Env vars still win, so the systemd unit and the redeploy script can
+# override without editing the file.
+CONF=""
+for candidate in "$REPO/scripts/deployed-lineage-guard.conf" "$GUARD_DIR/deployed-lineage-guard.conf"; do
+  if [ -f "$candidate" ]; then CONF="$candidate"; break; fi
+done
+conf_get() {
+  sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n 1
+}
+
+FIX_COMMIT="${PAPERCLIP_FIX_COMMIT:-$(conf_get DEPLOYED_FIX_COMMIT)}"
+FIX_COMMIT="${FIX_COMMIT:-fa3c22dd14a2502ed055ef6e7c309478ff7d5346}"
+DURABLE_REMOTE="${PAPERCLIP_DURABLE_REMOTE:-$(conf_get DEPLOYED_DURABLE_REMOTE)}"
+DURABLE_REMOTE="${DURABLE_REMOTE:-fork}"
+DURABLE_BRANCH="${PAPERCLIP_DURABLE_BRANCH:-$(conf_get DEPLOYED_DURABLE_BRANCH)}"
+DURABLE_BRANCH="${DURABLE_BRANCH:-ton/deployed-long-active-fix}"
 # The invariant is not the remote's NAME (a fresh clone may call it anything)
 # but WHICH REPOSITORY it points at: our fork carries the fix, upstream deleted
 # the feature. So we assert the URL, and we assert upstream is not it.
-DURABLE_URL_PATTERN="${PAPERCLIP_DURABLE_URL_PATTERN:-tonytouch/paperclip}"
-FORBIDDEN_URL_PATTERN="${PAPERCLIP_FORBIDDEN_URL_PATTERN:-paperclipai/paperclip}"
-SERVICE="server/src/services/productivity-review.ts"
-TESTFILE="server/src/__tests__/productivity-review-service.test.ts"
-MARKER="findLiveContinuationPath"
+DURABLE_URL_PATTERN="${PAPERCLIP_DURABLE_URL_PATTERN:-$(conf_get DEPLOYED_DURABLE_URL_PATTERN)}"
+DURABLE_URL_PATTERN="${DURABLE_URL_PATTERN:-tonytouch/paperclip}"
+FORBIDDEN_URL_PATTERN="${PAPERCLIP_FORBIDDEN_URL_PATTERN:-$(conf_get DEPLOYED_FORBIDDEN_URL_PATTERN)}"
+FORBIDDEN_URL_PATTERN="${FORBIDDEN_URL_PATTERN:-paperclipai/paperclip}"
+SERVICE="${PAPERCLIP_SERVICE:-$(conf_get DEPLOYED_SERVICE)}"
+SERVICE="${SERVICE:-server/src/services/productivity-review.ts}"
+TESTFILE="${PAPERCLIP_TESTFILE:-$(conf_get DEPLOYED_TESTFILE)}"
+TESTFILE="${TESTFILE:-server/src/__tests__/productivity-review-service.test.ts}"
+MARKER="${PAPERCLIP_MARKER:-$(conf_get DEPLOYED_MARKER)}"
+MARKER="${MARKER:-findLiveContinuationPath}"
 HOOK_NAMES="pre-commit pre-merge-commit post-merge post-checkout pre-push"
-GUARD_ASSETS="scripts/deployed-lineage-guard.sh scripts/paperclip-deploy-check.sh scripts/install-deployed-lineage-guard.sh scripts/redeploy-paperclip.sh"
+GUARD_ASSETS="scripts/deployed-lineage-guard.sh scripts/deployed-lineage-guard.conf scripts/paperclip-deploy-check.sh scripts/install-deployed-lineage-guard.sh scripts/redeploy-paperclip.sh scripts/repin-deployed-lineage.sh"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 fail() { echo "[$(ts)] deployed-lineage-guard: FAIL - $1"; exit "${2:-1}"; }
 
-if [ ! -d "$REPO/.git" ]; then
+if [ ! -e "$REPO/.git" ]; then
   echo "[$(ts)] deployed-lineage-guard: FAIL - no git repo at $REPO"
   exit 2
 fi

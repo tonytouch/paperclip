@@ -18,7 +18,7 @@ set -uo pipefail
 INSTALLER_SELF="${BASH_SOURCE[0]}"
 INSTALLER_DIR="$(cd "$(dirname "$INSTALLER_SELF")" && pwd)"
 DEFAULT_REPO="$(cd "$INSTALLER_DIR/.." 2>/dev/null && pwd)"
-if [ -n "$DEFAULT_REPO" ] && [ -d "$DEFAULT_REPO/.git" ]; then
+if [ -n "$DEFAULT_REPO" ] && [ -e "$DEFAULT_REPO/.git" ]; then
   REPO="${PAPERCLIP_DEPLOYED_REPO:-$DEFAULT_REPO}"
 else
   REPO="${PAPERCLIP_DEPLOYED_REPO:-/home/tony/tonysplace_best/workspace/paperclip}"
@@ -29,7 +29,7 @@ HOOK_NAMES="pre-commit pre-merge-commit post-merge post-checkout pre-push"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-if [ ! -d "$REPO/.git" ]; then
+if [ ! -e "$REPO/.git" ]; then
   echo "[$(ts)] install-deployed-lineage-guard: FAIL - no git repo at $REPO"
   exit 2
 fi
@@ -65,6 +65,16 @@ fi
 
 cp "$REPO/scripts/deployed-lineage-guard.sh" "$GUARD_DIR/deployed-lineage-guard.sh"
 chmod 0755 "$GUARD_DIR/deployed-lineage-guard.sh"
+
+# TON-1129 - the installed guard lives OUTSIDE the repo, so it cannot read the
+# pin from the repo on every run without a second copy of the repo's layout.
+# Install the pin next to it so the installed runner knows the invariant even
+# if the tree's scripts/ directory is temporarily missing.
+if [ -f "$REPO/scripts/deployed-lineage-guard.conf" ]; then
+  cp "$REPO/scripts/deployed-lineage-guard.conf" "$GUARD_DIR/deployed-lineage-guard.conf"
+  chmod 0644 "$GUARD_DIR/deployed-lineage-guard.conf"
+  echo "[$(ts)] install-deployed-lineage-guard: installed pin file deployed-lineage-guard.conf"
+fi
 
 cat > "$UNIT_DIR/paperclip-guard-deployed-lineage.service" <<UNIT
 [Unit]
