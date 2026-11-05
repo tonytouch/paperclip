@@ -44,6 +44,24 @@ Session resume is cwd-aware: if the agent's working directory changed since the 
 
 If resume fails with an unknown session error, the adapter automatically retries with a fresh session.
 
+### Connection dropped mid-response (recovery)
+
+Symptom in logs / issue thread:
+
+```
+Internal error: API Error: Connection closed mid-response. The response above may be incomplete.
+```
+
+The upstream stream was cut mid-flight. That is a transient failure, not a
+deterministic fault, so the adapter records it as `errorCode:
+"claude_transient_upstream"` / `errorFamily: "transient_upstream"`, which
+engages the heartbeat's bounded retry ladder. Because the truncated transcript
+must not be resumed, the adapter also sets `clearSession: true` so the retry
+starts from a clean session.
+
+See [Transient upstream failures](/adapters/transient-upstream-failures) for the
+full root cause and runbook.
+
 ### Poisoned `previous_message_id` (recovery)
 
 Symptom in logs / issue thread:

@@ -1472,6 +1472,71 @@ describe("claude execute", () => {
     }
   });
 
+  /**
+   * TON-522: "Internal error: API Error: Connection closed mid-response" is a
+   * transport interruption, not a capacity refusal and not a deterministic
+   * fault. Before this was classified, the CLI engine reported errorCode=null
+   * and the heartbeat parked the issue as `blocked` with no owner - one
+   * dropped connection killed the whole run.
+   */
+  it("classifies a mid-response connection drop as transient upstream and clears the session", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-conn-drop-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "error",
+        session_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        is_error: true,
+        result:
+          "Internal error: API Error: Connection closed mid-response. The response above may be incomplete.",
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-connection-drop",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("claude_transient_upstream");
+      expect(result.errorFamily).toBe("transient_upstream");
+      // The truncated transcript must not be resumed: the retry starts fresh.
+      expect(result.clearSession).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not reclassify deterministic Claude failures (auth, max turns) as transient", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-max-turns-"));
     const workspace = path.join(root, "workspace");

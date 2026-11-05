@@ -4,6 +4,7 @@ import {
   extractClaudeRetryNotBefore,
   isClaudeProviderQuotaError,
   isClaudeTransientUpstreamError,
+  isClaudeTransportInterruptionError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
@@ -147,6 +148,71 @@ describe("isClaudeTransientUpstreamError", () => {
           is_error: true,
           result: "API Error: 400 diagnostics.previous_message_id: must be the `id` from a prior /v1/messages response (starts with `msg_`)",
         },
+      }),
+    ).toBe(false);
+  });
+
+  it("classifies a mid-response connection drop as transient (TON-522)", () => {
+    // This is the exact error that killed the CTO run behind TON-510: the
+    // upstream stream was cut mid-flight. It matched no capacity pattern, so
+    // the CLI engine reported errorCode=null (a deterministic failure) and the
+    // heartbeat stranded the issue instead of retrying it.
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          subtype: "success",
+          is_error: true,
+          result:
+            "Internal error: API Error: Connection closed mid-response. The response above may be incomplete.",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeTransientUpstreamError({
+        errorMessage: "API Error: Connection closed mid-response",
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeTransientUpstreamError({
+        stderr: "socket hang up",
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("isClaudeTransportInterruptionError", () => {
+  it("detects a mid-response connection drop", () => {
+    expect(
+      isClaudeTransportInterruptionError({
+        parsed: {
+          subtype: "success",
+          is_error: true,
+          result: "API Error: Connection closed mid-response",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not treat a plain rate limit as a transport interruption", () => {
+    expect(
+      isClaudeTransportInterruptionError({
+        errorMessage: "429 rate limit exceeded, try again later",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not treat a provider-quota refusal as a transport interruption", () => {
+    expect(
+      isClaudeTransportInterruptionError({
+        errorMessage: "You're out of extra usage · resets 4pm (America/Chicago)",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not treat a deterministic refusal as a transport interruption", () => {
+    expect(
+      isClaudeTransportInterruptionError({
+        errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
       }),
     ).toBe(false);
   });

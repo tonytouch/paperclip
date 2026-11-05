@@ -53,6 +53,7 @@ import {
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeTransientUpstreamError,
+  isClaudeTransportInterruptionError,
   isClaudeUnknownSessionError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeImageProcessingError,
@@ -883,6 +884,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: proc.stderr,
           errorMessage: fallbackErrorMessage,
         });
+      // A transport interruption leaves the on-disk transcript half-written, so
+      // resuming that session would replay a truncated exchange. Drop it and
+      // let the retry start clean (TON-522).
+      const transportInterruption =
+        transientUpstream &&
+        isClaudeTransportInterruptionError({
+          parsed: null,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const transientRetryNotBefore = providerQuota || transientUpstream
         ? extractClaudeRetryNotBefore({
             parsed: null,
@@ -923,7 +935,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
         },
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        clearSession: transportInterruption || Boolean(opts.clearSessionOnMissingSession),
       };
     }
 
@@ -1001,6 +1013,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: proc.stderr,
         errorMessage,
       });
+    // A transport interruption leaves the on-disk transcript half-written, so
+    // resuming that session would replay a truncated exchange. Drop it and let
+    // the retry start clean - the same treatment the ACP engine gives a
+    // transient upstream failure (TON-522).
+    const transportInterruption =
+      failed &&
+      transientUpstream &&
+      isClaudeTransportInterruptionError({
+        parsed,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        errorMessage,
+      });
     const transientRetryNotBefore = providerQuota || transientUpstream
       ? extractClaudeRetryNotBefore({
           parsed,
@@ -1067,6 +1092,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // state error. Force the server to drop persisted session state for
         // this issue so the next continuation starts from a clean slate.
         poisonedPreviousMessageId ||
+        // Clear-on-transport-drop: the upstream stream was cut mid-flight, so
+        // the persisted transcript is truncated. Resuming it would replay a
+        // half-written exchange; the retry must start fresh (TON-522).
+        transportInterruption ||
         Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
     };
   };

@@ -1,3 +1,5 @@
+import { TRANSPORT_INTERRUPTION_PATTERNS } from "../transient-transport.js";
+
 /**
  * Transport-level upstream failures that are safe to retry.
  *
@@ -13,13 +15,12 @@
  * upstream-capacity signals qualify; a broad pattern would misclassify a
  * genuinely broken adapter as retryable and loop forever.
  */
+
 const TRANSIENT_UPSTREAM_TRANSPORT_PATTERNS: readonly RegExp[] = [
-  /connection\s+closed\s+mid[- ]response/i,
-  /\bsocket\s+hang\s?up\b/i,
-  /\beconnreset\b/i,
-  /\bepipe\b/i,
-  /connection\s+reset\s+by\s+peer/i,
-  /premature(?:ly)?\s+clos(?:e|ed|ing)/i,
+  // The transport-interruption vocabulary is shared with the Claude CLI
+  // adapter's own classifier, so "Connection closed mid-response" means the
+  // same thing on both engines (see ../../transient-transport.ts).
+  ...TRANSPORT_INTERRUPTION_PATTERNS,
   /\boverloaded(?:_error)?\b/i,
   /\bserver\s+overloaded\b/i,
   /\bservice\s+unavailable\b/i,

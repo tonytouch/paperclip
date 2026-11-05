@@ -99,6 +99,7 @@
             "pages": [
               "adapters/overview",
               "adapters/claude-local",
+              "adapters/transient-upstream-failures",
               "adapters/codex-local",
               "adapters/process",
               "adapters/http",

@@ -5,6 +5,7 @@ import {
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isTransportInterruptionMessage } from "@paperclipai/adapter-utils/transient-transport";
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
@@ -432,7 +433,43 @@ export function isClaudeTransientUpstreamError(input: {
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;
   if (isClaudeProviderQuotaError(input)) return false;
+  // A transport interruption (the upstream stream cut mid-flight) is a
+  // CAPACITY-independent transient: the same prompt normally succeeds on a
+  // fresh session. Before this, "Connection closed mid-response" matched
+  // neither the capacity regex nor anything else, so the CLI engine reported
+  // errorCode=null - a deterministic failure - and the heartbeat stranded the
+  // issue instead of engaging its bounded transient retry ladder (TON-522).
+  if (isTransportInterruptionMessage(haystack)) return true;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
+}
+
+/**
+ * True when the failure was a transport interruption of the upstream stream
+ * ("Connection closed mid-response", a reset socket, ...). Such a failure
+ * leaves the on-disk Claude transcript half-written, so the session must NOT
+ * be resumed: the next attempt has to start fresh. This mirrors the ACP
+ * engine's `clearSession` on a transient upstream failure.
+ */
+export function isClaudeTransportInterruptionError(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const parsed = input.parsed ?? null;
+  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
+    return false;
+  }
+  const loginMeta = detectClaudeLoginRequired({
+    parsed,
+    stdout: input.stdout ?? "",
+    stderr: input.stderr ?? "",
+  });
+  if (loginMeta.requiresLogin) return false;
+  if (isClaudeProviderQuotaError(input)) return false;
+  const haystack = buildClaudeTransientHaystack(input);
+  if (!haystack) return false;
+  return isTransportInterruptionMessage(haystack);
 }
 
 export function isClaudeProviderQuotaError(input: {
