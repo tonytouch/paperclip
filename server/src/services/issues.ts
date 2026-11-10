@@ -6784,6 +6784,69 @@ export function issueService(db: Db) {
         && (candidate.executionRunId == null || candidate.executionRunId === actorRunId)
       );
 
+      /**
+       * The issue is held by the actor's OWN parked retry.
+       *
+       * A `scheduled_retry` row parks against an issue and becomes the
+       * issue's `executionRunId` while it waits for its `scheduledRetryAt`.
+       * The parked row holds no process, but it DOES hold the issue lock, so
+       * the guard below used to answer 409 "Issue run ownership conflict" for
+       * the very agent that owns the parked row - the agent could not cancel
+       * the issue that was waiting on its own retry (TON-1185).
+       *
+       * There is no competing owner to protect: the parked row is the actor's
+       * own, for this very issue, and the cancel sweep that runs after this
+       * guard kills it. The lock is therefore released by the very action the
+       * guard is standing in front of.
+       *
+       * A FOREIGN live lock (another agent's `running` row) is deliberately
+       * NOT matched here: it stays a 409.
+       */
+      const resolveOwnParkedRetryOwnership = async (candidate: {
+        id: string;
+        status: string;
+        assigneeAgentId: string | null;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      }) => {
+        if (!candidate.executionRunId) return null;
+        if (candidate.assigneeAgentId !== actorAgentId) return null;
+
+        // A live checkout lock owned by somebody else is a real competing
+        // owner. The parked-retry allowance must not become a blanket bypass:
+        // it only applies when no OTHER run holds the checkout.
+        if (
+          candidate.checkoutRunId != null
+          && candidate.checkoutRunId !== actorRunId
+          && candidate.checkoutRunId !== candidate.executionRunId
+        ) {
+          return null;
+        }
+
+        const parked = await db
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            agentId: heartbeatRuns.agentId,
+            contextSnapshot: heartbeatRuns.contextSnapshot,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, candidate.executionRunId))
+          .then((rows) => rows[0] ?? null);
+        if (!parked) return null;
+
+        // Only a PARKED row qualifies. A `running` row is a live owner, even
+        // when it belongs to the same agent - that is a real concurrent run.
+        if (parked.status !== "scheduled_retry" && parked.status !== "queued") return null;
+        if (parked.agentId !== actorAgentId) return null;
+
+        const snapshot = parked.contextSnapshot as Record<string, unknown> | null | undefined;
+        if (!snapshot || typeof snapshot !== "object") return null;
+        if (snapshot.issueId !== candidate.id) return null;
+
+        return { ...candidate, adoptedFromRunId: null as string | null };
+      };
+
       const resolveOwnership = async (
         candidate: {
           id: string;
@@ -6795,6 +6858,9 @@ export function issueService(db: Db) {
       ) => {
         const sameRunOwnership = resolveSameRunOwnership(candidate);
         if (sameRunOwnership) return { ownership: sameRunOwnership, latest: null };
+
+        const ownParkedRetryOwnership = await resolveOwnParkedRetryOwnership(candidate);
+        if (ownParkedRetryOwnership) return { ownership: ownParkedRetryOwnership, latest: null };
 
         if (canAdoptUnownedCheckout(candidate)) {
           const adopted = await adoptUnownedCheckoutRun({
