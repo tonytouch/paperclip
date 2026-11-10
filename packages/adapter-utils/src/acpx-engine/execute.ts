@@ -155,6 +155,112 @@ interface AcpxPreparedRuntime {
 
 const defaultWarmHandles = new Map<string, RuntimeCacheEntry>();
 
+/**
+ * TON-1321: bound the live ACPX session fleet per seat.
+ *
+ * Every ACPX session is its own agent process tree (the ACP server plus the
+ * `claude` grandchild it spawns), and sessions are keyed per task. A seat
+ * that finishes many cards therefore accumulates one session per card, which
+ * is how the fleet grew to dozens of live `claude` processes on a host with
+ * no free memory. This registry keeps at most one idle session per seat:
+ * when the seat starts a newer session, the older idle one is closed, which
+ * releases its process tree.
+ */
+type LiveAcpxSession = {
+  sessionKey: string;
+  runtime: AcpRuntime;
+  handle: AcpRuntimeHandle;
+  activeRuns: number;
+  seq: number;
+};
+
+const liveAcpxSessionsByAgent = new Map<string, LiveAcpxSession[]>();
+let liveAcpxSessionSeq = 0;
+
+export function resetLiveAcpxSessions(): void {
+  liveAcpxSessionsByAgent.clear();
+}
+
+/**
+ * Register the session a run is about to use and close the seat's older idle
+ * sessions. A session with a running turn is never closed here: its own run
+ * owns it until the turn ends. The seat keeps at most one idle session.
+ */
+export async function trackAcpxSession(params: {
+  agentKey: string;
+  sessionKey: string;
+  runtime: AcpRuntime;
+  handle: AcpRuntimeHandle;
+  warmHandles?: Map<string, RuntimeCacheEntry>;
+}): Promise<void> {
+  const { agentKey, sessionKey, runtime, handle, warmHandles } = params;
+  liveAcpxSessionSeq += 1;
+  const sessions = liveAcpxSessionsByAgent.get(agentKey) ?? [];
+  const existing = sessions.find((session) => session.sessionKey === sessionKey);
+  if (existing) {
+    existing.runtime = runtime;
+    existing.handle = handle;
+    existing.seq = liveAcpxSessionSeq;
+  } else {
+    sessions.push({
+      sessionKey,
+      runtime,
+      handle,
+      activeRuns: 0,
+      seq: liveAcpxSessionSeq,
+    });
+  }
+  liveAcpxSessionsByAgent.set(agentKey, sessions);
+
+  const keeper = sessions.reduce((newest, session) =>
+    session.seq > newest.seq ? session : newest,
+  );
+  for (const session of [...sessions]) {
+    if (session === keeper || session.activeRuns > 0) continue;
+    sessions.splice(sessions.indexOf(session), 1);
+    await closeIdleAcpxSession(session, warmHandles);
+  }
+}
+
+/** Mark the seat's session as in use by a running turn. */
+export function retainAcpxSession(agentKey: string, sessionKey: string): void {
+  const entry = liveAcpxSessionsByAgent
+    .get(agentKey)
+    ?.find((session) => session.sessionKey === sessionKey);
+  if (!entry) return;
+  entry.activeRuns += 1;
+}
+
+/** Release the seat's session when its turn ends. */
+export function releaseAcpxSession(agentKey: string, sessionKey: string): void {
+  const entry = liveAcpxSessionsByAgent
+    .get(agentKey)
+    ?.find((session) => session.sessionKey === sessionKey);
+  if (!entry) return;
+  entry.activeRuns = Math.max(0, entry.activeRuns - 1);
+}
+
+async function closeIdleAcpxSession(
+  entry: LiveAcpxSession,
+  warmHandles?: Map<string, RuntimeCacheEntry>,
+): Promise<void> {
+  const warm = warmHandles?.get(entry.sessionKey);
+  if (warm) {
+    clearWarmHandleTimer(warm);
+    warmHandles?.delete(entry.sessionKey);
+  }
+  try {
+    await entry.runtime.close({
+      handle: entry.handle,
+      reason: "paperclip session superseded by a newer session for the same seat",
+      discardPersistentState: false,
+    });
+  } catch {
+    // The session may already be gone. A failed close must never fail the run
+    // that superseded it.
+  }
+}
+
 function resolveEngineSettings(options: AcpxEngineExecutorOptions): AcpxEngineSettings {
   const moduleDir = path.resolve(options.moduleDir ?? defaultModuleDir);
   return {
@@ -1863,6 +1969,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
 
   return async function executeAcpxEngine(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
     const prepared = await buildRuntime({ ctx, engine });
+    // TON-1321: the seat is the fleet bound. One idle ACPX session per seat.
+    const agentKey = `${ctx.agent.companyId}:${ctx.agent.id}`;
     // State the effective wall-clock timeout and its source up front so a
     // later timeout is diagnosable from the run log alone. Goes to stderr:
     // the acpx stdout log stream carries JSON acpx.* event payloads and must
@@ -1964,6 +2072,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       };
     }
     const sessionHandle = handle;
+    // TON-1321: track the session so the seat's fleet stays bounded.
+    await trackAcpxSession({
+      agentKey,
+      sessionKey: prepared.sessionKey,
+      runtime,
+      handle: sessionHandle,
+      warmHandles,
+    });
     try {
       await applySessionConfigOptions({
         runtime,
@@ -2066,6 +2182,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           void cancelActiveTurn?.(formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)).catch(() => {});
         }, timeoutMs);
       }
+      retainAcpxSession(agentKey, prepared.sessionKey);
       const turn = runtime.startTurn({
         handle: sessionHandle,
         text: runPrompt,
@@ -2356,6 +2473,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         resultJson: { phase: "turn" },
         summary: message,
       };
+    } finally {
+      // TON-1321: the seat's session is idle again. The next session this
+      // seat starts supersedes it and closes it.
+      releaseAcpxSession(agentKey, prepared.sessionKey);
     }
   };
 }

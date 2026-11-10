@@ -64,6 +64,11 @@ import {
 import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
+import {
+  getGlobalRunBudget,
+  logRunBudgetDecision,
+  withCompanyRunBudgetLock,
+} from "./run-budget.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
@@ -10228,6 +10233,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // TON-1321: company-wide running count. The per-seat counter cannot see
+  // the fleet's real footprint, so the memory budget needs its own view.
+  async function countRunningRunsForCompany(companyId: string) {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "running")));
+    return Number(count ?? 0);
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -11535,9 +11550,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
-      const claimed = await claimQueuedRun(run);
+      // TON-1321: the per-seat `maxConcurrentRuns` bounds one seat's runs.
+      // It does not bound the fleet: 6 seats x 20 runs is 120 concurrent runs
+      // on a host whose cgroup is already over `memory.high` because of the
+      // session processes those runs leave behind. The company-wide budget
+      // below is sized from the memory budget, and pauses dispatch entirely
+      // when the cgroup approaches its limit.
+      const claimed = await withCompanyRunBudgetLock(run.companyId, async () => {
+        const budget = await getGlobalRunBudget();
+        if (budget.underMemoryPressure) {
+          logRunBudgetDecision({
+            companyId: run.companyId,
+            agentId: run.agentId,
+            runId: run.id,
+            decision: "paused_memory_pressure",
+            budget,
+          });
+          return null;
+        }
+        const companyRunningRuns = await countRunningRunsForCompany(run.companyId);
+        if (companyRunningRuns >= budget.maxConcurrentRuns) {
+          logRunBudgetDecision({
+            companyId: run.companyId,
+            agentId: run.agentId,
+            runId: run.id,
+            decision: "paused_global_cap",
+            budget,
+            companyRunningRuns,
+          });
+          return null;
+        }
+        return await claimQueuedRun(run);
+      });
       if (!claimed) {
-        // claimQueuedRun can also leave the run queued when dependencies are unresolved.
+        // claimQueuedRun can also leave the run queued when dependencies are unresolved,
+        // and the company-wide budget leaves it queued when the fleet is at its cap.
         return;
       }
       run = claimed;
