@@ -833,6 +833,13 @@ export async function startServer(): Promise<StartedServer> {
     }
   };
 
+  // The startup heartbeat recovery scans the (large) heartbeat_runs table.
+  // It must NOT gate the HTTP listener: while it runs the process has no
+  // listener, so the API is dark and no seat can be woken, no run can
+  // report back, and no recovery action can be filed. The listener binds
+  // first; the recovery is awaited after it has bound.
+  let startupHeartbeatRecoveryPromise: Promise<unknown> | null = null;
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
@@ -920,7 +927,8 @@ export async function startServer(): Promise<StartedServer> {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
       trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
-      await startupHeartbeatRecovery;
+      // Scheduled, not awaited: see the note on startupHeartbeatRecoveryPromise.
+      startupHeartbeatRecoveryPromise = startupHeartbeatRecovery;
     }
 
     const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
@@ -1154,6 +1162,13 @@ export async function startServer(): Promise<StartedServer> {
       resolveListen();
     });
   });
+
+  // The startup heartbeat recovery is awaited only AFTER the HTTP listener has
+  // bound. Startup still completes only once recovery has run, but the API is
+  // available throughout -- a slow recovery must never leave the company mute.
+  if (startupHeartbeatRecoveryPromise) {
+    await startupHeartbeatRecoveryPromise;
+  }
   
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
