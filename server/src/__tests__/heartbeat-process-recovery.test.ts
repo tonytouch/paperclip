@@ -682,6 +682,63 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("failed");
   });
 
+  // TON-1243: an ACP-engine seat never records a pid -- the ACP wrapper runs behind
+  // the adapter, so there is no child process to track. For such a run the OS-liveness
+  // check reads "dead" unconditionally, so the orphan reaper used to mark healthy,
+  // actively-executing runs `process_lost` and release their issue with nothing
+  // running it (the `stranded_assigned_issue` signature).
+  it("does not reap an in-memory tracked local-child run that never recorded a pid", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+      runStatus: "running",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+
+    // The server is executing this run right now.
+    runningProcesses.set(runId, { pid: 424_242 });
+
+    const reaperHeartbeat = heartbeatService(db);
+    const result = await reaperHeartbeat.reapOrphanedRuns({ staleThresholdMs: 0 });
+    expect(result.reaped).toBe(0);
+    expect(result.runIds).not.toContain(runId);
+
+    const stillRunning = await reaperHeartbeat.getRun(runId);
+    expect(stillRunning?.status).toBe("running");
+    expect(stillRunning?.errorCode).toBeNull();
+  });
+
+  it("reaps a pid-less local-child run the server is not executing and queues one bounded retry", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "idle",
+      runStatus: "running",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+
+    const reaperHeartbeat = heartbeatService(db);
+    const result = await reaperHeartbeat.reapOrphanedRuns({ staleThresholdMs: 0 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toContain(runId);
+
+    const reaped = await reaperHeartbeat.getRun(runId);
+    expect(reaped?.status).toBe("failed");
+    expect(reaped?.errorCode).toBe("process_lost");
+
+    // The run is not left without a successor: a single bounded retry is queued so
+    // the issue is not released as a stranded assignment.
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries.length).toBe(1);
+    expect(retries[0]?.processLossRetryCount).toBe(1);
+  });
+
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";

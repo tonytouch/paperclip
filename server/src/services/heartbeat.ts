@@ -11059,6 +11059,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
+      // TON-1243: a run with no recorded pid has no OS-level liveness to verify.
+      // ACP-engine seats (`adapterConfig.engine === "acp"`) never persist a pid --
+      // the ACP wrapper runs behind the adapter, not as a tracked child -- so for
+      // those runs the pid check below always reads "dead".
+      const hasPersistedPid = !!run.processPid || !!run.processGroupId;
 
       // Runs tracked in-memory are normally still executing. An in-memory handle can go
       // stale when the OS process dies without delivering an exit event (e.g. an external
@@ -11069,6 +11074,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const trackedInMemory = runningProcesses.has(run.id) || activeRunExecutions.has(run.id);
       if (trackedInMemory && !tracksLocalChild) continue;
       if (trackedInMemory && (processPidAlive || processGroupAlive)) continue;
+      // TON-1243: a run the server is actively executing, but for which no pid was
+      // ever recorded, cannot be proven dead by an OS check. Reaping it here marks a
+      // healthy run `process_lost` and releases its issue with no run to hand back,
+      // which is what surfaces as `stranded_assigned_issue`. In-memory tracking is
+      // the only liveness oracle those runs have, so trust it; a genuinely wedged
+      // run is still reclaimed by reclaimStalledRunningRuns on its activity bound.
+      if (trackedInMemory && !hasPersistedPid) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -11107,7 +11119,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      // TON-1243: an orphaned local-child run gets exactly one retry whether or not a
+      // pid was recorded for it. The pid-less case is the ACP-engine signature: the
+      // server restarted under the run and left its row `running`. Without a retry
+      // the issue is released with nothing running it, which is what surfaces as the
+      // `stranded_assigned_issue` recovery actions the CEO seat accumulated.
+      const shouldRetry = tracksLocalChild && (run.processLossRetryCount ?? 0) < 1;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
         ? {
@@ -11160,13 +11177,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       const retryAgent = await getAgent(run.agentId);
-      if (shouldRetry) {
-        if (retryAgent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+      if (retryAgent) {
+        if (hasPersistedPid) {
+          if (shouldRetry) {
+            retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          }
+        } else {
+          // TON-1243: a run with no recorded pid reached here because the server is
+          // not executing it any more. Prefer the interaction-continuation infra
+          // retry when the run is bound to one (unchanged behaviour), and otherwise
+          // give it the same single bounded process-loss retry a pid-bearing run
+          // gets, so its issue is not released with nothing running it.
+          const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
+          retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
+          if (!retriedRun && shouldRetry) {
+            retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          }
         }
-      } else if (retryAgent) {
-        const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
-        retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
 
       if (!retriedRun) {
